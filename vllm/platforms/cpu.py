@@ -264,8 +264,8 @@ class CpuPlatform(Platform):
                 backend = "eager"
             else:
                 backend = "inductor"
-
-            compilation_config.mode = CompilationMode.DYNAMO_TRACE_ONCE
+            print("Yes, VLLM_COMPILE IS ENABLED BY DEFAULT")
+            compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
             compilation_config.backend = backend
             compilation_config.inductor_compile_config.update(
                 {
