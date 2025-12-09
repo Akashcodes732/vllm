@@ -7,15 +7,7 @@
 #endif
 #include "cpu/micro_gemm/cpu_micro_gemm_vec.hpp"
 
-#if defined(__powerpc__)
-  // POWER lacks a vectorized FP16 implementation, so only expose BF16 paths.
-  #define VLLM_DISPATCH_CASE_16B_TYPES(...) \
-    AT_DISPATCH_CASE(at::ScalarType::BFloat16, __VA_ARGS__)
-#else
-  #define VLLM_DISPATCH_CASE_16B_TYPES(...)                 \
-    AT_DISPATCH_CASE(at::ScalarType::BFloat16, __VA_ARGS__) \
-    AT_DISPATCH_CASE(at::ScalarType::Half, __VA_ARGS__)
-#endif
+
 #define VLLM_DISPATCH_16B_TYPES(TYPE, NAME, ...) \
   AT_DISPATCH_SWITCH(TYPE, NAME, VLLM_DISPATCH_CASE_16B_TYPES(__VA_ARGS__))
 
