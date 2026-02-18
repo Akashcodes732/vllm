@@ -2018,7 +2018,6 @@ class EngineArgs:
         # Disable chunked prefill and prefix caching for:
         # POWER (ppc64le)/s390x/RISCV CPUs in V1
         if current_platform.is_cpu() and current_platform.get_cpu_architecture() in (
-            CpuArchEnum.POWERPC,
             CpuArchEnum.S390X,
             CpuArchEnum.RISCV,
         ):
