@@ -526,18 +526,18 @@ def _causal_conv1d_fn_cpu(
             x_padded = torch.nn.functional.pad(x_seq, (state_len, 0))
 
         # Depthwise conv1d: for each channel independently
-        # weight: (dim, width) — apply as depthwise filter
-        # x_padded: (dim, state_len + seq_len)
-        # Output length = seq_len (causal: no padding on right)
-        out_seq = torch.zeros(dim, seq_len, dtype=x.dtype, device=x.device)
-        for i in range(seq_len):
-            # Extract window: (dim, width)
-            window = x_padded[:, i : i + width]
-            # Element-wise multiply and sum over width
-            val = (window * weight).sum(dim=1)  # (dim,)
-            if bias is not None:
-                val = val + bias
-            out_seq[:, i] = val
+        # x_padded_batch: (1, dim, state_len + seq_len)
+        x_padded_batch = x_padded.unsqueeze(0)
+        # weight_conv: (dim, 1, width)
+        weight_conv = weight.unsqueeze(1)
+        
+        # F.conv1d performs the exact cross-correlation matching our previous for-loop
+        out_seq = torch.nn.functional.conv1d(
+            x_padded_batch,
+            weight=weight_conv,
+            bias=bias,
+            groups=dim
+        ).squeeze(0)  # (dim, seq_len)
 
         # Apply activation
         if activation in ["silu", "swish"]:
@@ -552,7 +552,7 @@ def _causal_conv1d_fn_cpu(
             # Shift and append
             conv_states[cache_idx, :, : state_len - seq_len] = conv_states[
                 cache_idx, :, seq_len:state_len
-            ]
+            ].clone()
             conv_states[cache_idx, :, state_len - seq_len :] = x_seq
 
     return out.to(original_x_dtype)
