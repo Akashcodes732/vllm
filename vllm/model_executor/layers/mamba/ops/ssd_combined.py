@@ -10,18 +10,121 @@ import torch
 from einops import rearrange
 from packaging import version
 
-from vllm.triton_utils import triton
+from vllm.triton_utils import HAS_TRITON, triton
 
 from .ssd_bmm import _bmm_chunk_fwd
 from .ssd_chunk_scan import _chunk_scan_fwd
 from .ssd_chunk_state import _chunk_cumsum_fwd, _chunk_state_fwd
 from .ssd_state_passing import _state_passing_fwd
 
-TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
+TRITON_22 = HAS_TRITON and version.parse(triton.__version__) >= version.parse("2.2.0")
 
 
 def is_int_pow_2(n):
     return isinstance(n, int) and n > 0 and (n & (n - 1)) == 0
+
+def _mamba_chunk_scan_combined_fwd_cpu(
+    x,          # (seqlen, nheads, headdim)
+    dt,         # (seqlen, nheads)
+    A,          # (nheads,)
+    B,          # (seqlen, ngroups, dstate)
+    C,          # (seqlen, ngroups, dstate)
+    chunk_size,
+    out,        # (seqlen, nheads, headdim) - preallocated
+    D=None,
+    z=None,
+    dt_bias=None,
+    initial_states=None,
+    return_intermediate_states=False,
+    seq_idx=None,
+    cu_seqlens=None,
+    cu_chunk_seqlens=None,
+    last_chunk_indices=None,
+    dt_softplus=False,
+    dt_limit=(0.0, float("inf")),
+    state_dtype=None,
+):
+    """Pure PyTorch CPU fallback for the entire SSD scan pipeline.
+
+    Replaces all 5 Triton sub-ops with a single sequential SSM scan.
+    For each token: state = state * exp(A*dt) + outer(x*dt, B),
+                    y = (state * C).sum(-1) + D*x, optionally gated by z.
+    """
+    seqlen, nheads, headdim = x.shape
+    _, ngroups, dstate = B.shape
+    nheads_per_group = nheads // ngroups
+
+    assert cu_seqlens is not None
+    batch = cu_seqlens.size(0) - 1
+
+    # Prepare dt
+    dt_f = dt.float()
+    if dt_bias is not None:
+        dt_f = dt_f + dt_bias.float().unsqueeze(0)
+    if dt_softplus:
+        dt_f = torch.nn.functional.softplus(dt_f)
+    if dt_limit[0] > 0.0 or dt_limit[1] < float("inf"):
+        dt_f = dt_f.clamp(min=dt_limit[0], max=dt_limit[1])
+
+    # Preallocate final states: (batch, nheads, headdim, dstate)
+    all_states = torch.zeros(
+        batch, nheads, headdim, dstate,
+        dtype=torch.float32, device=x.device
+    )
+
+    for b_idx in range(batch):
+        seq_start = cu_seqlens[b_idx].item()
+        seq_end = cu_seqlens[b_idx + 1].item()
+
+        # Initialize state: (nheads, headdim, dstate)
+        if initial_states is not None:
+            state = initial_states[b_idx].float()
+        else:
+            state = torch.zeros(
+                nheads, headdim, dstate,
+                dtype=torch.float32, device=x.device
+            )
+
+        for t in range(seq_start, seq_end):
+            x_t = x[t].float()     # (nheads, headdim)
+            dt_t = dt_f[t]         # (nheads,)
+            A_val = A.float()      # (nheads,)
+
+            # dA = exp(A * dt) -> (nheads, 1, 1) for broadcasting
+            dA = torch.exp(A_val * dt_t).unsqueeze(-1).unsqueeze(-1)
+
+            # Expand B,C from groups to heads: (ngroups, dstate) -> (nheads, dstate)
+            B_expanded = B[t].float().repeat_interleave(
+                nheads_per_group, dim=0)  # (nheads, dstate)
+            C_expanded = C[t].float().repeat_interleave(
+                nheads_per_group, dim=0)  # (nheads, dstate)
+
+            # State update — all heads at once
+            # outer(x*dt, B) -> (nheads, headdim, dstate)
+            xdt = (x_t * dt_t.unsqueeze(-1))  # (nheads, headdim)
+            dBx = xdt.unsqueeze(-1) * B_expanded.unsqueeze(1)  # (nheads, headdim, dstate)
+            state = state * dA + dBx
+
+            # Output: (state * C).sum(-1) -> (nheads, headdim)
+            y = (state * C_expanded.unsqueeze(1)).sum(dim=-1)
+
+            if D is not None:
+                y = y + x_t * D.float().unsqueeze(-1) if D.dim() == 1 else y + x_t * D.float()
+
+            if z is not None:
+                z_t = z[t].float()  # (nheads, headdim)
+                y = y * z_t * torch.sigmoid(z_t)
+
+            out[t] = y.to(out.dtype)
+
+        all_states[b_idx] = state.to(all_states.dtype)
+
+    # Cast to expected output dtype (matches Triton path behavior)
+    out_dtype = state_dtype if state_dtype is not None else x.dtype
+    all_states = all_states.to(out_dtype)
+
+    return all_states
+
 
 
 def _mamba_chunk_scan_combined_fwd(
@@ -45,6 +148,21 @@ def _mamba_chunk_scan_combined_fwd(
     dt_limit=(0.0, float("inf")),
     state_dtype=None,
 ):
+    if not HAS_TRITON:
+        return _mamba_chunk_scan_combined_fwd_cpu(
+            x, dt, A, B, C, chunk_size, out,
+            D=D, z=z, dt_bias=dt_bias,
+            initial_states=initial_states,
+            return_intermediate_states=return_intermediate_states,
+            seq_idx=seq_idx,
+            cu_seqlens=cu_seqlens,
+            cu_chunk_seqlens=cu_chunk_seqlens,
+            last_chunk_indices=last_chunk_indices,
+            dt_softplus=dt_softplus,
+            dt_limit=dt_limit,
+            state_dtype=state_dtype,
+        )
+
     assert is_int_pow_2(chunk_size), "chunk_size must be integer power of 2"
     seqlen, nheads, headdim = x.shape
     _, ngroups, dstate = B.shape

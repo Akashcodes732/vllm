@@ -8,7 +8,7 @@
 import numpy as np
 import torch
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 
 
@@ -466,6 +466,212 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         tl.store(o_ptrs, acc, mask=mask_1d)
 
 
+def _causal_conv1d_fn_cpu(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    activation: str | None = "silu",
+    pad_slot_id: int = PAD_SLOT_ID,
+) -> torch.Tensor:
+    """Pure PyTorch CPU fallback for causal_conv1d_fn (prefill path).
+
+    Implements depthwise causal 1D convolution over variable-length sequences
+    with conv state caching and optional SiLU activation.
+    """
+    if isinstance(activation, bool) and activation:
+        activation = "silu"
+
+    original_x_dtype = x.dtype
+    x = x.to(conv_states.dtype)
+    dim, cu_seqlen = x.shape
+    _, width = weight.shape
+    state_len = width - 1
+    out = torch.empty_like(x)
+    batch = query_start_loc.size(0) - 1
+
+    for b in range(batch):
+        seq_start = query_start_loc[b].item()
+        seq_end = query_start_loc[b + 1].item()
+        seq_len = seq_end - seq_start
+        if seq_len == 0:
+            continue
+
+        # Determine cache index for this sequence
+        if cache_indices is not None:
+            cache_idx = cache_indices[b].item()
+            if cache_idx == pad_slot_id:
+                continue
+        else:
+            cache_idx = b
+
+        # Get initial state if available
+        use_initial = (has_initial_state is not None
+                       and has_initial_state[b].item())
+
+        # x_seq: (dim, seq_len)
+        x_seq = x[:, seq_start:seq_end]
+
+        if use_initial:
+            # Prepend conv state to input for full convolution context
+            # conv_state: (dim, state_len)
+            init_state = conv_states[cache_idx, :, :state_len]
+            # Concatenate: (dim, state_len + seq_len)
+            x_padded = torch.cat([init_state, x_seq], dim=1)
+        else:
+            # Zero-pad on the left
+            x_padded = torch.nn.functional.pad(x_seq, (state_len, 0))
+
+        # Depthwise conv1d: for each channel independently
+        # weight: (dim, width) — apply as depthwise filter
+        # x_padded: (dim, state_len + seq_len)
+        # Output length = seq_len (causal: no padding on right)
+        out_seq = torch.zeros(dim, seq_len, dtype=x.dtype, device=x.device)
+        for i in range(seq_len):
+            # Extract window: (dim, width)
+            window = x_padded[:, i : i + width]
+            # Element-wise multiply and sum over width
+            val = (window * weight).sum(dim=1)  # (dim,)
+            if bias is not None:
+                val = val + bias
+            out_seq[:, i] = val
+
+        # Apply activation
+        if activation in ["silu", "swish"]:
+            out_seq = out_seq * torch.sigmoid(out_seq)
+
+        out[:, seq_start:seq_end] = out_seq
+
+        # Update conv state with last `state_len` tokens
+        if seq_len >= state_len:
+            conv_states[cache_idx, :, :state_len] = x_seq[:, -state_len:]
+        else:
+            # Shift and append
+            conv_states[cache_idx, :, : state_len - seq_len] = conv_states[
+                cache_idx, :, seq_len:state_len
+            ]
+            conv_states[cache_idx, :, state_len - seq_len :] = x_seq
+
+    return out.to(original_x_dtype)
+
+
+def _causal_conv1d_update_cpu(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    activation: bool | str | None = None,
+    conv_state_indices: torch.Tensor | None = None,
+    query_start_loc: torch.Tensor | None = None,
+    pad_slot_id: int = PAD_SLOT_ID,
+) -> torch.Tensor:
+    """Pure PyTorch CPU fallback for causal_conv1d_update (decode path).
+
+    Vectorized: processes all batch elements simultaneously using
+    batched tensor operations instead of Python for-loops.
+    """
+    if isinstance(activation, bool):
+        activation = "silu" if activation else None
+
+    original_x_dtype = x.dtype
+    x = x.to(conv_state.dtype)
+    _, width = weight.shape
+    state_len = width - 1
+
+    if query_start_loc is None and x.dim() == 2:
+        x = x.unsqueeze(-1)
+        unsqueeze = True
+    else:
+        unsqueeze = False
+
+    # Fast path: no varlen, handle all batches at once
+    if query_start_loc is None:
+        batch, dim, seqlen = x.shape
+
+        if conv_state_indices is not None:
+            cache_idxs = conv_state_indices.flatten()
+            # Build valid mask (non-padded entries)
+            valid_mask = cache_idxs != pad_slot_id  # (batch,)
+        else:
+            cache_idxs = torch.arange(batch, device=x.device)
+            valid_mask = torch.ones(batch, dtype=torch.bool, device=x.device)
+
+        for t in range(seqlen):
+            x_t = x[:, :, t].clone()  # (batch, dim) - clone to avoid aliasing
+
+            # Gather states for all valid batch entries
+            states = conv_state[cache_idxs]  # (batch, dim, state_len)
+
+            # Build windows: [state, x_t] -> (batch, dim, width)
+            windows = torch.cat([states, x_t.unsqueeze(-1)], dim=-1)
+
+            # Compute: (batch, dim, width) * (dim, width) -> sum over width
+            # weight is (dim, width), broadcast over batch
+            val = (windows * weight.unsqueeze(0)).sum(dim=-1)  # (batch, dim)
+            if bias is not None:
+                val = val + bias.unsqueeze(0)
+
+            if activation in ["silu", "swish"]:
+                val = val * torch.sigmoid(val)
+
+            # Mask out padded entries
+            val = val * valid_mask.unsqueeze(-1).to(val.dtype)
+            x[:, :, t] = val
+
+            # Shift state left, push ORIGINAL x_t (not computed val)
+            new_state = torch.cat(
+                [states[:, :, 1:], x_t.unsqueeze(-1)], dim=-1
+            )  # (batch, dim, state_len)
+            conv_state[cache_idxs] = new_state
+
+        out = x
+        if unsqueeze:
+            out = out.squeeze(-1)
+        return out.to(original_x_dtype)
+
+    # Varlen path: must loop over sequences (different lengths)
+    batch = conv_state_indices.size(0)
+    dim = x.size(1)
+    out = x.clone()
+
+    for b in range(batch):
+        cache_idx = conv_state_indices[b].item()
+        if cache_idx == pad_slot_id:
+            continue
+
+        seq_start = query_start_loc[b].item()
+        seq_end = query_start_loc[b + 1].item()
+        seqlen_b = seq_end - seq_start
+
+        if seqlen_b == 0:
+            continue
+
+        local_state = conv_state[cache_idx].clone()  # (dim, state_len)
+
+        for t in range(seqlen_b):
+            x_t = x[seq_start + t, :]  # (dim,)
+
+            window = torch.cat([local_state, x_t.unsqueeze(-1)], dim=-1)
+            val = (window * weight).sum(dim=-1)
+            if bias is not None:
+                val = val + bias
+            if activation in ["silu", "swish"]:
+                val = val * torch.sigmoid(val)
+
+            out[seq_start + t, :] = val
+
+            if state_len > 1:
+                local_state[:, :-1] = local_state[:, 1:].clone()
+            local_state[:, -1] = x_t
+
+        conv_state[cache_idx] = local_state
+
+    return out.to(original_x_dtype)
+
+
 def causal_conv1d_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -536,6 +742,12 @@ def causal_conv1d_fn(
         The block size to align the cached states to
     out: same shape as `x`
     """
+    if not HAS_TRITON:
+        return _causal_conv1d_fn_cpu(
+            x, weight, bias, conv_states, query_start_loc,
+            cache_indices, has_initial_state, activation, pad_slot_id,
+        )
+
     if isinstance(activation, bool) and activation:
         activation = "silu"
 
@@ -1122,6 +1334,12 @@ def causal_conv1d_update(
             indices 0 and 3
     out: (batch, dim) or (batch, dim, seqlen) or (num_tokens, dim), same shape as `x`
     """
+    if not HAS_TRITON:
+        return _causal_conv1d_update_cpu(
+            x, conv_state, weight, bias, activation,
+            conv_state_indices, query_start_loc, null_block_id,
+        )
+
     if validate_data:
         assert null_block_id is not None
         assert x.stride(1) == 1
