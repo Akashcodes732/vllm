@@ -7,6 +7,7 @@
 import torch
 from packaging import version
 
+from vllm.model_executor.custom_op import CustomOp
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.mamba.ops.triton_helpers import fast_exp
 from vllm.triton_utils import HAS_TRITON, tl, triton
@@ -316,7 +317,10 @@ def _selective_scan_update_kernel(
         tl.store(dst_state_ptrs, state, mask=mask)
 
 
-def selective_state_update(
+from .cpu_fallbacks import _selective_state_update_cpu
+
+
+def _selective_state_update_cuda(
     state,
     x,
     dt,
@@ -430,77 +434,12 @@ def selective_state_update(
         assert num_accepted_tokens.shape == (N,)
 
     if not HAS_TRITON:
-        # CPU fallback: vectorized PyTorch implementation of SSM state update
-        nheads_ngroups_ratio = nheads // ngroups
-        for seq_idx in range(N):
-            if cu_seqlens is not None:
-                bos = cu_seqlens[seq_idx].item()
-                seq_len = cu_seqlens[seq_idx + 1].item() - bos
-            else:
-                bos = seq_idx
-                seq_len = 1
-
-            # Determine state indices
-            if state_batch_indices is not None:
-                state_idx = state_batch_indices[seq_idx, 0].item()
-                if state_idx == null_block_id:
-                    continue
-            else:
-                state_idx = seq_idx
-
-            if dst_state_batch_indices is not None:
-                dst_idx = dst_state_batch_indices[seq_idx, 0].item()
-            else:
-                dst_idx = state_idx
-
-            # Load state for all heads at once: (nheads, dim, dstate)
-            s = state[state_idx].float()
-
-            for t in range(seq_len):
-                token_idx = bos + t
-
-                x_val = x[token_idx].float()   # (nheads, dim)
-                dt_val = dt[token_idx].float()  # (nheads, dim)
-
-                if dt_bias is not None:
-                    dt_val = dt_val + dt_bias.float()
-                if dt_softplus:
-                    dt_val = torch.nn.functional.softplus(dt_val)
-
-                A_val = A.float()  # (nheads, dim, dstate)
-
-                # Expand B and C from groups to heads
-                # B: (ngroups, dstate) -> (nheads, dstate)
-                B_val = B[token_idx].float()  # (ngroups, dstate)
-                B_expanded = B_val.repeat_interleave(
-                    nheads_ngroups_ratio, dim=0)  # (nheads, dstate)
-                C_val = C[token_idx].float()  # (ngroups, dstate)
-                C_expanded = C_val.repeat_interleave(
-                    nheads_ngroups_ratio, dim=0)  # (nheads, dstate)
-
-                # SSM state update — all heads at once
-                # dA = exp(A * dt) -> (nheads, dim, dstate)
-                dA = torch.exp(A_val * dt_val.unsqueeze(-1))
-                # dB*x: outer product -> (nheads, dim, dstate)
-                dBx = (B_expanded.unsqueeze(1)
-                       * (x_val * dt_val).unsqueeze(-1))
-                s = s * dA + dBx
-
-                # Output: sum(state * C, dim=-1) -> (nheads, dim)
-                out_val = (s * C_expanded.unsqueeze(1)).sum(dim=-1)
-
-                if D is not None:
-                    out_val = out_val + x_val * D.float()
-
-                if z is not None:
-                    z_val = z[token_idx].float()  # (nheads, dim)
-                    out_val = out_val * z_val * torch.sigmoid(z_val)
-
-                out[token_idx] = out_val.to(out.dtype)
-
-            # Store final state for all heads
-            state[dst_idx] = s.to(state.dtype)
-        return
+        return _selective_state_update_cpu(
+            state, x, dt, A, B, C, D, z, dt_bias, dt_softplus,
+            state_batch_indices, dst_state_batch_indices,
+            null_block_id, out, num_accepted_tokens, cu_seqlens,
+            is_blackwell, enable_stochastic_rounding, cache_philox_rounds
+        )
 
     grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE_M"]), N, nheads)
     z_strides = (z.stride(0), z.stride(1), z.stride(2)) if z is not None else (0, 0, 0)
