@@ -158,6 +158,7 @@ def _mamba_chunk_scan_combined_fwd_cuda(
     else:
         return states[last_chunk_indices]
 
+@CustomOp.register("mamba_chunk_scan_combined_fwd")
 class MambaChunkScanCombinedFwdOp(CustomOp):
     def forward_native(self, *args, **kwargs):
         return _mamba_chunk_scan_combined_fwd_cpu(*args, **kwargs)

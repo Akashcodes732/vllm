@@ -1245,6 +1245,7 @@ def _causal_conv1d_update_cuda(
     return out.to(original_x_dtype)
 
 
+@CustomOp.register("causal_conv1d_fn")
 class CausalConv1dFnOp(CustomOp):
     def forward_native(self, *args, **kwargs):
         return _causal_conv1d_fn_cpu(*args, **kwargs)
@@ -1256,6 +1257,7 @@ class CausalConv1dFnOp(CustomOp):
         return _causal_conv1d_fn_cuda(*args, **kwargs)
 
 
+@CustomOp.register("causal_conv1d_update")
 class CausalConv1dUpdateOp(CustomOp):
     def forward_native(self, *args, **kwargs):
         return _causal_conv1d_update_cpu(*args, **kwargs)

@@ -668,3 +668,20 @@ def selective_scan_fn(
         return delta  # output written inplace to delta
     else:
         return z  # output written inplace to z
+
+@CustomOp.register("selective_state_update")
+class SelectiveStateUpdateOp(CustomOp):
+    def forward_native(self, *args, **kwargs):
+        return _selective_state_update_cpu(*args, **kwargs)
+
+    def forward_cpu(self, *args, **kwargs):
+        return _selective_state_update_cpu(*args, **kwargs)
+
+    def forward_cuda(self, *args, **kwargs):
+        return _selective_state_update_cuda(*args, **kwargs)
+
+_selective_state_update_op = SelectiveStateUpdateOp()
+
+def selective_state_update(*args, **kwargs):
+    return _selective_state_update_op(*args, **kwargs)
+
