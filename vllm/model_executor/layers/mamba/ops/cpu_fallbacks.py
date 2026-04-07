@@ -14,6 +14,7 @@ def _causal_conv1d_fn_cpu(
     has_initial_state: torch.Tensor | None = None,
     activation: str | None = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
+    **kwargs,
 ) -> torch.Tensor:
     """Pure PyTorch CPU fallback for causal_conv1d_fwd."""
     if isinstance(activation, bool) and activation:
@@ -88,6 +89,7 @@ def _causal_conv1d_update_cpu(
     conv_state_indices: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
     pad_slot_id: int = PAD_SLOT_ID,
+    **kwargs,
 ) -> torch.Tensor:
     """Pure PyTorch CPU fallback for causal_conv1d_update (decode path)."""
     if isinstance(activation, bool):
@@ -200,6 +202,7 @@ def _selective_state_update_cpu(
     is_blackwell=False,
     enable_stochastic_rounding=False,
     cache_philox_rounds=0,
+    **kwargs,
 ):
     if state.dim() == 3:
         state = state.unsqueeze(1)
@@ -314,6 +317,7 @@ def _mamba_chunk_scan_combined_fwd_cpu(
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
     state_dtype=None,
+    **kwargs,
 ):
     seqlen, nheads, headdim = x.shape
     _, ngroups, dstate = B.shape
