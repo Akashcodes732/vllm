@@ -5,9 +5,8 @@
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 
 
-import torch
-import torch.nn as nn
 import numpy as np
+import torch
 
 from vllm.model_executor.custom_op import CustomOp
 from vllm.triton_utils import tl, triton

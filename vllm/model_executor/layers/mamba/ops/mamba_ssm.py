@@ -12,6 +12,7 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.mamba.ops.triton_helpers import fast_exp
 from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
 from .cpu_fallbacks import _selective_state_update_cpu
 
 TRITON3 = HAS_TRITON and (version.parse(triton.__version__) >= version.parse("3.0.0"))

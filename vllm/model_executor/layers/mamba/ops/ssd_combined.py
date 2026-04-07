@@ -13,11 +13,11 @@ from packaging import version
 from vllm.model_executor.custom_op import CustomOp
 from vllm.triton_utils import HAS_TRITON, triton
 
+from .cpu_fallbacks import _mamba_chunk_scan_combined_fwd_cpu
 from .ssd_bmm import _bmm_chunk_fwd
 from .ssd_chunk_scan import _chunk_scan_fwd
 from .ssd_chunk_state import _chunk_cumsum_fwd, _chunk_state_fwd
 from .ssd_state_passing import _state_passing_fwd
-from .cpu_fallbacks import _mamba_chunk_scan_combined_fwd_cpu
 
 TRITON_22 = HAS_TRITON and version.parse(triton.__version__) >= version.parse("2.2.0")
 
@@ -47,7 +47,6 @@ def _mamba_chunk_scan_combined_fwd_cuda(
     dt_limit=(0.0, float("inf")),
     state_dtype=None,
 ):
-
     assert is_int_pow_2(chunk_size), "chunk_size must be integer power of 2"
     seqlen, nheads, headdim = x.shape
     _, ngroups, dstate = B.shape
