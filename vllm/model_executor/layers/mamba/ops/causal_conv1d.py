@@ -6,9 +6,13 @@
 
 
 import torch
+import torch.nn as nn
+import numpy as np
+
 from vllm.model_executor.custom_op import CustomOp
-from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
+
 from .cpu_fallbacks import _causal_conv1d_fn_cpu, _causal_conv1d_update_cpu
 
 
@@ -1272,8 +1276,10 @@ class CausalConv1dUpdateOp(CustomOp):
 _causal_conv1d_fn_op = CausalConv1dFnOp()
 _causal_conv1d_update_op = CausalConv1dUpdateOp()
 
+
 def causal_conv1d_fn(*args, **kwargs):
     return _causal_conv1d_fn_op(*args, **kwargs)
+
 
 def causal_conv1d_update(*args, **kwargs):
     return _causal_conv1d_update_op(*args, **kwargs)

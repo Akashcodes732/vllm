@@ -17,15 +17,13 @@ from .ssd_bmm import _bmm_chunk_fwd
 from .ssd_chunk_scan import _chunk_scan_fwd
 from .ssd_chunk_state import _chunk_cumsum_fwd, _chunk_state_fwd
 from .ssd_state_passing import _state_passing_fwd
+from .cpu_fallbacks import _mamba_chunk_scan_combined_fwd_cpu
 
 TRITON_22 = HAS_TRITON and version.parse(triton.__version__) >= version.parse("2.2.0")
 
 
 def is_int_pow_2(n):
     return isinstance(n, int) and n > 0 and (n & (n - 1)) == 0
-
-from .cpu_fallbacks import _mamba_chunk_scan_combined_fwd_cpu
-
 
 
 def _mamba_chunk_scan_combined_fwd_cuda(
@@ -158,6 +156,7 @@ def _mamba_chunk_scan_combined_fwd_cuda(
     else:
         return states[last_chunk_indices]
 
+
 @CustomOp.register("mamba_chunk_scan_combined_fwd")
 class MambaChunkScanCombinedFwdOp(CustomOp):
     def forward_native(self, *args, **kwargs):
@@ -169,7 +168,9 @@ class MambaChunkScanCombinedFwdOp(CustomOp):
     def forward_cuda(self, *args, **kwargs):
         return _mamba_chunk_scan_combined_fwd_cuda(*args, **kwargs)
 
+
 _mamba_chunk_scan_combined_fwd_op = MambaChunkScanCombinedFwdOp()
+
 
 def _mamba_chunk_scan_combined_fwd(*args, **kwargs):
     return _mamba_chunk_scan_combined_fwd_op(*args, **kwargs)

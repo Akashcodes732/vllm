@@ -7,11 +7,12 @@
 import torch
 from packaging import version
 
-from vllm.model_executor.custom_op import CustomOp
 from vllm import _custom_ops as ops
+from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.mamba.ops.triton_helpers import fast_exp
 from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+from .cpu_fallbacks import _selective_state_update_cpu
 
 TRITON3 = HAS_TRITON and (version.parse(triton.__version__) >= version.parse("3.0.0"))
 
@@ -49,8 +50,9 @@ cvt.rs.f16x2.f32 $0, $2, $1, $3;
 @triton.heuristics({"HAS_Z": lambda args: args["z_ptr"] is not None})
 @triton.heuristics(
     {
-        "HAS_STATE_BATCH_INDICES": lambda args: args["state_batch_indices_ptr"]
-        is not None
+        "HAS_STATE_BATCH_INDICES": lambda args: (
+            args["state_batch_indices_ptr"] is not None
+        )
     }
 )
 @triton.heuristics(
@@ -317,9 +319,6 @@ def _selective_scan_update_kernel(
         tl.store(dst_state_ptrs, state, mask=mask)
 
 
-from .cpu_fallbacks import _selective_state_update_cpu
-
-
 def _selective_state_update_cuda(
     state,
     x,
@@ -435,10 +434,25 @@ def _selective_state_update_cuda(
 
     if not HAS_TRITON:
         return _selective_state_update_cpu(
-            state, x, dt, A, B, C, D, z, dt_bias, dt_softplus,
-            state_batch_indices, dst_state_batch_indices,
-            null_block_id, out, num_accepted_tokens, cu_seqlens,
-            is_blackwell, enable_stochastic_rounding, cache_philox_rounds
+            state,
+            x,
+            dt,
+            A,
+            B,
+            C,
+            D,
+            z,
+            dt_bias,
+            dt_softplus,
+            state_batch_indices,
+            dst_state_batch_indices,
+            null_block_id,
+            out,
+            num_accepted_tokens,
+            cu_seqlens,
+            is_blackwell,
+            enable_stochastic_rounding,
+            cache_philox_rounds,
         )
 
     grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE_M"]), N, nheads)
@@ -669,6 +683,7 @@ def selective_scan_fn(
     else:
         return z  # output written inplace to z
 
+
 @CustomOp.register("selective_state_update")
 class SelectiveStateUpdateOp(CustomOp):
     def forward_native(self, *args, **kwargs):
@@ -680,8 +695,9 @@ class SelectiveStateUpdateOp(CustomOp):
     def forward_cuda(self, *args, **kwargs):
         return _selective_state_update_cuda(*args, **kwargs)
 
+
 _selective_state_update_op = SelectiveStateUpdateOp()
+
 
 def selective_state_update(*args, **kwargs):
     return _selective_state_update_op(*args, **kwargs)
-

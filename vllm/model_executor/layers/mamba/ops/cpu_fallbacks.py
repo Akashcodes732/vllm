@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
-from vllm.v1.attention.backends.utils import PAD_SLOT_ID, NULL_BLOCK_ID
+
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
+
 
 def _causal_conv1d_fn_cpu(
     x: torch.Tensor,
@@ -49,8 +51,7 @@ def _causal_conv1d_fn_cpu(
         if has_initial_state is not None and has_initial_state[b]:
             state = conv_states[cache_idx].clone()  # (dim, state_len)
         else:
-            state = torch.zeros((dim, state_len),
-                                dtype=x.dtype, device=x.device)
+            state = torch.zeros((dim, state_len), dtype=x.dtype, device=x.device)
 
         for t in range(seq_len):
             x_t = x_seq[:, t]  # (dim,)
@@ -133,9 +134,7 @@ def _causal_conv1d_update_cpu(
             val = val * valid_mask.unsqueeze(-1).to(val.dtype)
             x[:, :, t] = val
 
-            new_state = torch.cat(
-                [states[:, :, 1:], x_t.unsqueeze(-1)], dim=-1
-            )
+            new_state = torch.cat([states[:, :, 1:], x_t.unsqueeze(-1)], dim=-1)
             conv_state[cache_idxs[valid_mask]] = new_state[valid_mask]
 
         out = x
@@ -143,8 +142,9 @@ def _causal_conv1d_update_cpu(
             out = out.squeeze(-1)
         return out.to(original_x_dtype)
 
+    assert conv_state_indices is not None
+    assert query_start_loc is not None
     batch = conv_state_indices.size(0)
-    dim = x.size(1)
     out = x.clone()
 
     for b in range(batch):
@@ -231,10 +231,7 @@ def _selective_state_update_cpu(
 
     _, nheads, dim, dstate = state.shape
     batch = x.shape[0]
-    if cu_seqlens is not None:
-        N = len(cu_seqlens) - 1
-    else:
-        N = batch
+    N = len(cu_seqlens) - 1 if cu_seqlens is not None else batch
 
     ngroups = B.shape[1]
     nheads_ngroups_ratio = nheads // ngroups
@@ -281,7 +278,7 @@ def _selective_state_update_cpu(
             C_expanded = C_val.repeat_interleave(nheads_ngroups_ratio, dim=0)
 
             dA = torch.exp(A_val * dt_val.unsqueeze(-1))
-            dBx = (B_expanded.unsqueeze(1) * (x_val * dt_val).unsqueeze(-1))
+            dBx = B_expanded.unsqueeze(1) * (x_val * dt_val).unsqueeze(-1)
             s = s * dA + dBx
 
             if num_accepted_tokens is not None:
@@ -300,19 +297,18 @@ def _selective_state_update_cpu(
 
             out[token_idx] = out_val.to(out.dtype)
 
-        if num_accepted_tokens is None:
-            if dst_idx != null_block_id:
-                state[dst_idx] = s.to(state.dtype)
+        if num_accepted_tokens is None and dst_idx != null_block_id:
+            state[dst_idx] = s.to(state.dtype)
 
 
 def _mamba_chunk_scan_combined_fwd_cpu(
-    x,          
-    dt,         
-    A,          
-    B,          
-    C,          
+    x,
+    dt,
+    A,
+    B,
+    C,
     chunk_size,
-    out,        
+    out,
     D=None,
     z=None,
     dt_bias=None,
@@ -343,8 +339,7 @@ def _mamba_chunk_scan_combined_fwd_cpu(
         dt_f = dt_f.clamp(min=dt_limit[0], max=dt_limit[1])
 
     all_states = torch.zeros(
-        batch, nheads, headdim, dstate,
-        dtype=torch.float32, device=x.device
+        batch, nheads, headdim, dstate, dtype=torch.float32, device=x.device
     )
 
     for b_idx in range(batch):
@@ -355,33 +350,34 @@ def _mamba_chunk_scan_combined_fwd_cpu(
             state = initial_states[b_idx].float()
         else:
             state = torch.zeros(
-                nheads, headdim, dstate,
-                dtype=torch.float32, device=x.device
+                nheads, headdim, dstate, dtype=torch.float32, device=x.device
             )
 
         for t in range(seq_start, seq_end):
-            x_t = x[t].float()     
-            dt_t = dt_f[t]         
-            A_val = A.float()      
+            x_t = x[t].float()
+            dt_t = dt_f[t]
+            A_val = A.float()
 
             dA = torch.exp(A_val * dt_t).unsqueeze(-1).unsqueeze(-1)
 
-            B_expanded = B[t].float().repeat_interleave(
-                nheads_per_group, dim=0)  
-            C_expanded = C[t].float().repeat_interleave(
-                nheads_per_group, dim=0)  
+            B_expanded = B[t].float().repeat_interleave(nheads_per_group, dim=0)
+            C_expanded = C[t].float().repeat_interleave(nheads_per_group, dim=0)
 
-            xdt = (x_t * dt_t.unsqueeze(-1))  
-            dBx = xdt.unsqueeze(-1) * B_expanded.unsqueeze(1)  
+            xdt = x_t * dt_t.unsqueeze(-1)
+            dBx = xdt.unsqueeze(-1) * B_expanded.unsqueeze(1)
             state = state * dA + dBx
 
             y = (state * C_expanded.unsqueeze(1)).sum(dim=-1)
 
             if D is not None:
-                y = y + x_t * D.float().unsqueeze(-1) if D.dim() == 1 else y + x_t * D.float()
+                y = (
+                    y + x_t * D.float().unsqueeze(-1)
+                    if D.dim() == 1
+                    else y + x_t * D.float()
+                )
 
             if z is not None:
-                z_t = z[t].float()  
+                z_t = z[t].float()
                 y = y * z_t * torch.sigmoid(z_t)
 
             out[t] = y.to(out.dtype)
