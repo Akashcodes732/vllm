@@ -47,7 +47,7 @@ def _causal_conv1d_fn_cpu(
         x_seq = x[:, seq_start:seq_end]  # (dim, seq_len)
 
         if has_initial_state is not None and has_initial_state[b]:
-            state = conv_states[cache_idx]  # (dim, state_len)
+            state = conv_states[cache_idx].clone()  # (dim, state_len)
         else:
             state = torch.zeros((dim, state_len),
                                 dtype=x.dtype, device=x.device)
@@ -136,7 +136,7 @@ def _causal_conv1d_update_cpu(
             new_state = torch.cat(
                 [states[:, :, 1:], x_t.unsqueeze(-1)], dim=-1
             )
-            conv_state[cache_idxs] = new_state
+            conv_state[cache_idxs[valid_mask]] = new_state[valid_mask]
 
         out = x
         if unsqueeze:
@@ -254,10 +254,11 @@ def _selective_state_update_cpu(
         else:
             state_idx = seq_idx
 
-        if dst_state_batch_indices is not None:
-            dst_idx = dst_state_batch_indices[seq_idx, 0].item()
-        else:
-            dst_idx = state_idx
+        if num_accepted_tokens is None:
+            if dst_state_batch_indices is not None:
+                dst_idx = dst_state_batch_indices[seq_idx, 0].item()
+            else:
+                dst_idx = state_idx
 
         s = state[state_idx].float()
 
@@ -283,6 +284,11 @@ def _selective_state_update_cpu(
             dBx = (B_expanded.unsqueeze(1) * (x_val * dt_val).unsqueeze(-1))
             s = s * dA + dBx
 
+            if num_accepted_tokens is not None:
+                token_dst_idx = dst_state_batch_indices[seq_idx, t].item()
+                if token_dst_idx != null_block_id:
+                    state[token_dst_idx] = s.to(state.dtype)
+
             out_val = (s * C_expanded.unsqueeze(1)).sum(dim=-1)
 
             if D is not None:
@@ -294,7 +300,9 @@ def _selective_state_update_cpu(
 
             out[token_idx] = out_val.to(out.dtype)
 
-        state[dst_idx] = s.to(state.dtype)
+        if num_accepted_tokens is None:
+            if dst_idx != null_block_id:
+                state[dst_idx] = s.to(state.dtype)
 
 
 def _mamba_chunk_scan_combined_fwd_cpu(
