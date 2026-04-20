@@ -124,7 +124,7 @@ def generate_header_file() -> str:
   #include "cpu_attn_vxe.hpp"
 #endif
 
-#ifdef __powerpc64__
+#ifdef __powerpc__
   #include "cpu_attn_vsx.hpp"
 #endif
 
@@ -195,7 +195,7 @@ def generate_header_file() -> str:
 """
 
     # ppc64le with VSX
-    header += """#elif defined(__powerpc64__)
+    header += """#elif defined(__powerpc__)
 #define CPU_ATTN_DISPATCH(HEAD_DIM, ISA_TYPE, ...) \\
   [&] { \\
     int64_t encoded_params = encode_cpu_attn_params(HEAD_DIM, ISA_TYPE); \\
@@ -230,7 +230,7 @@ def generate_header_file() -> str:
     } \\
   }()
 
-#endif  /* CPU_CAPABILITY_AMXBF16 / __aarch64__ / __s390x__ / __powerpc64__ */
+#endif  /* CPU_CAPABILITY_AMXBF16 / __aarch64__ / __s390x__ / __powerpc__ */
 
 #endif  // CPU_ATTN_DISPATCH_GENERATED_H
 """
