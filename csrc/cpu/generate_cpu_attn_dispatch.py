@@ -149,7 +149,7 @@ def generate_header_file() -> str:
   #include "cpu_attn_vxe.hpp"
 #endif
 
-#ifdef __powerpc64__
+#ifdef __powerpc__
   #include "cpu_attn_vsx.hpp"
 #endif
 
@@ -213,7 +213,7 @@ def generate_header_file() -> str:
         fp8=False,
     )
     header += _macro_block(
-        "#elif defined(__powerpc64__)",
+        "#elif defined(__powerpc__)",
         ["VSX", "VEC", "VEC16"],
         fp8=False,
     )
@@ -233,7 +233,7 @@ def generate_header_file() -> str:
         fp8=False,
     )
     header += (
-        "#endif  /* CPU_CAPABILITY_AMXBF16 / __aarch64__ / __s390x__ / __powerpc64__ */\n\n"
+        "#endif  /* CPU_CAPABILITY_AMXBF16 / __aarch64__ / __s390x__ / __powerpc__ */\n\n"
         "#endif  // CPU_ATTN_DISPATCH_GENERATED_H\n"
     )
 
