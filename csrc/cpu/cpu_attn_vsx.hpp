@@ -46,8 +46,8 @@ FORCE_INLINE void load_row8_B_as_f32<c10::BFloat16>(const c10::BFloat16* p,
   __vector unsigned short zeros = vec_splat_u16(0);
 
   // LE: zeros in low 16 bits, raw in high 16 bits → bf16 << 16 == float32
-  b0 = (__vector float)vec_mergel(zeros, raw);
-  b1 = (__vector float)vec_mergeh(zeros, raw);
+  b0 = (__vector float)vec_mergeh(zeros, raw);
+  b1 = (__vector float)vec_mergel(zeros, raw);
 }
 
 // Note: c10::Half (FP16) is not supported on PowerPC architecture
