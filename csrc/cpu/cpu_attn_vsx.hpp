@@ -46,28 +46,11 @@ FORCE_INLINE void load_row8_B_as_f32<c10::BFloat16>(const c10::BFloat16* p,
   __vector unsigned short zeros = vec_splat_u16(0);
 
   // LE: zeros in low 16 bits, raw in high 16 bits → bf16 << 16 == float32
-  b0 = (__vector float)vec_mergeh(zeros, raw);
-  b1 = (__vector float)vec_mergel(zeros, raw);
+  b0 = (__vector float)vec_mergel(zeros, raw);
+  b1 = (__vector float)vec_mergeh(zeros, raw);
 }
 
-template <>
-FORCE_INLINE void load_row8_B_as_f32<c10::Half>(const c10::Half* p,
-                                                __vector float& b0,
-                                                __vector float& b1) {
-  alignas(16) float tmp[8];
-
-  tmp[0] = static_cast<float>(p[0]);
-  tmp[1] = static_cast<float>(p[1]);
-  tmp[2] = static_cast<float>(p[2]);
-  tmp[3] = static_cast<float>(p[3]);
-  tmp[4] = static_cast<float>(p[4]);
-  tmp[5] = static_cast<float>(p[5]);
-  tmp[6] = static_cast<float>(p[6]);
-  tmp[7] = static_cast<float>(p[7]);
-
-  b0 = vec_xl(0, (float*)tmp);
-  b1 = vec_xl(0, (float*)(tmp + 4));
-}
+// Note: c10::Half (FP16) is not supported on PowerPC architecture
 
 template <int32_t M, typename kv_cache_t>
 FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku4(
@@ -303,25 +286,14 @@ class AttentionImpl<ISA::VSX, scalar_t, head_dim> {
 
         int32_t d = 0;
         for (; d <= head_dim - 8; d += 8) {
-          if constexpr (is_bf16) {
-            __vector float v0, v1;
-            load_row8_B_as_f32<scalar_t>(curr_src + d, v0, v1);
+          __vector float v0, v1;
+          load_row8_B_as_f32<scalar_t>(curr_src + d, v0, v1);
 
-            v0 = vec_mul(v0, scale_vec);
-            v1 = vec_mul(v1, scale_vec);
+          v0 = vec_mul(v0, scale_vec);
+          v1 = vec_mul(v1, scale_vec);
 
-            vec_xst(v0, 0, curr_dst + d);
-            vec_xst(v1, 0, curr_dst + d + 4);
-          } else {
-            __vector float v0 = vec_xl(0, (float*)curr_src + d);
-            __vector float v1 = vec_xl(0, (float*)curr_src + d + 4);
-
-            v0 = vec_mul(v0, scale_vec);
-            v1 = vec_mul(v1, scale_vec);
-
-            vec_xst(v0, 0, curr_dst + d);
-            vec_xst(v1, 0, curr_dst + d + 4);
-          }
+          vec_xst(v0, 0, curr_dst + d);
+          vec_xst(v1, 0, curr_dst + d + 4);
         }
 
         for (; d < head_dim; ++d) {
