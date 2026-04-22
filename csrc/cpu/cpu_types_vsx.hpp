@@ -211,52 +211,98 @@ struct FP32Vec8 : public Vec<FP32Vec8> {
   }
 
   FP32Vec8 exp() const {
-    // TODO: Vectorize this
-    AliasReg ar;
-    ar.reg = reg;
-    f32x4x4_t ret;
-    ret.val[0][0] = std::exp(ar.values[0]);
-    ret.val[0][1] = std::exp(ar.values[1]);
-    ret.val[0][2] = std::exp(ar.values[2]);
-    ret.val[0][3] = std::exp(ar.values[3]);
-    ret.val[1][0] = std::exp(ar.values[4]);
-    ret.val[1][1] = std::exp(ar.values[5]);
-    ret.val[1][2] = std::exp(ar.values[6]);
-    ret.val[1][3] = std::exp(ar.values[7]);
-    return FP32Vec8(f32x4x2_t({ret.val[0], ret.val[1]}));
+    // Vectorized Taylor series approximation for exp(x)
+    const int terms = 10;
+    f32x4x2_t ret;
+
+    vector float result0 = vec_splats(1.0f);
+    vector float result1 = vec_splats(1.0f);
+    vector float term0 = vec_splats(1.0f);
+    vector float term1 = vec_splats(1.0f);
+    
+    for(int n = 1; n < terms; n++) {
+        vector float inv_n = vec_splats(1.0f / n);
+        
+        term0 = vec_mul(term0, reg.val[0]);
+        term0 = vec_mul(term0, inv_n);
+        result0 = vec_add(result0, term0);
+        
+        term1 = vec_mul(term1, reg.val[1]);
+        term1 = vec_mul(term1, inv_n);
+        result1 = vec_add(result1, term1);
+    }
+    
+    ret.val[0] = result0;
+    ret.val[1] = result1;
+    
+    return FP32Vec8(ret);
   }
 
-  FP32Vec8 tanh() const {
-    // TODO: Vectorize this
-    AliasReg ar;
-    ar.reg = reg;
-    f32x4x4_t ret;
-    ret.val[0][0] = std::tanh(ar.values[0]);
-    ret.val[0][1] = std::tanh(ar.values[1]);
-    ret.val[0][2] = std::tanh(ar.values[2]);
-    ret.val[0][3] = std::tanh(ar.values[3]);
-    ret.val[1][0] = std::tanh(ar.values[4]);
-    ret.val[1][1] = std::tanh(ar.values[5]);
-    ret.val[1][2] = std::tanh(ar.values[6]);
-    ret.val[1][3] = std::tanh(ar.values[7]);
-    return FP32Vec8(f32x4x2_t({ret.val[0], ret.val[1]}));
-  }
 
-  FP32Vec8 er() const {
-    // TODO: Vectorize this
-    AliasReg ar;
-    ar.reg = reg;
-    f32x4x4_t ret;
-    ret.val[0][0] = std::erf(ar.values[0]);
-    ret.val[0][1] = std::erf(ar.values[1]);
-    ret.val[0][2] = std::erf(ar.values[2]);
-    ret.val[0][3] = std::erf(ar.values[3]);
-    ret.val[1][0] = std::erf(ar.values[4]);
-    ret.val[1][1] = std::erf(ar.values[5]);
-    ret.val[1][2] = std::erf(ar.values[6]);
-    ret.val[1][3] = std::erf(ar.values[7]);
-    return FP32Vec8(f32x4x2_t({ret.val[0], ret.val[1]}));
-  }
+
+FP32Vec8 tanh() const {
+    const vector float one = vec_splats(1.0f);
+    const vector float two = vec_splats(2.0f);
+    f32x4x2_t ret;
+
+    for (int i = 0; i < 2; i++) {
+        vector float two_x = vec_mul(two, reg.val[i]);
+        
+        FP32Vec8 temp_vec(f32x4x2_t({two_x, vec_splats(0.0f)}));
+        vector float exp2x = temp_vec.exp().reg.val[0];
+        
+        vector float numerator = vec_sub(exp2x, one);
+        vector float denominator = vec_add(exp2x, one);
+        ret.val[i] = vec_div(numerator, denominator);
+    }
+    
+    return FP32Vec8(ret);
+}
+
+
+FP32Vec8 er() const {
+    const vector float a1 = vec_splats(0.254829592f);
+    const vector float a2 = vec_splats(-0.284496736f);
+    const vector float a3 = vec_splats(1.421413741f);
+    const vector float a4 = vec_splats(-1.453152027f);
+    const vector float a5 = vec_splats(1.061405429f);
+    const vector float p  = vec_splats(0.3275911f);
+    const vector float one = vec_splats(1.0f);
+    const vector float zero = vec_splats(0.0f);
+    
+    f32x4x2_t ret;
+    
+    for (int i = 0; i < 2; i++) {
+        vector float x = reg.val[i];
+        
+        vector bool int mask = vec_cmpge(x, zero);
+        vector float sign = vec_sel(vec_splats(-1.0f), one, mask);
+        
+        vector float abs_x = vec_abs(x);
+        
+        vector float t = vec_div(one, vec_madd(p, abs_x, one));
+        
+        vector float poly = a5;
+        poly = vec_madd(poly, t, a4);
+        poly = vec_madd(poly, t, a3);
+        poly = vec_madd(poly, t, a2);
+        poly = vec_madd(poly, t, a1);
+        poly = vec_mul(poly, t);
+    
+        vector float x_squared = vec_mul(abs_x, abs_x);
+        vector float neg_x_squared = vec_mul(vec_splats(-1.0f), x_squared);
+        FP32Vec8 exp_input(f32x4x2_t({neg_x_squared, vec_splats(0.0f)}));
+        vector float exp_term = exp_input.exp().reg.val[0];
+        
+        vector float y = vec_nmsub(poly, exp_term, one);
+
+        ret.val[i] = vec_mul(sign, y);
+    }
+    
+    return FP32Vec8(ret);
+}
+
+
 
   FP32Vec8 operator*(const FP32Vec8& b) const {
     return FP32Vec8(
