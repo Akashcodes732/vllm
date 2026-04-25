@@ -31,6 +31,8 @@ from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 # This import automatically registers `torch.ops.silly.attention`
 from . import silly_attention  # noqa: F401
 
+DEVICE_TYPE = current_platform.device_type
+
 
 def test_version():
     # Test the version comparison logic using the private function
@@ -203,6 +205,22 @@ def test_enforce_eager(vllm_runner, monkeypatch):
         pass
 
 
+@pytest.mark.forked
+def test_torch_compile_disable(vllm_runner, monkeypatch):
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    monkeypatch.setenv("TORCH_COMPILE_DISABLE", "1")
+    monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", "1")
+
+    with (
+        compilation_counter.expect(num_graphs_seen=0, stock_torch_compile_count=0),
+        vllm_runner(
+            "facebook/opt-125m",
+            gpu_memory_utilization=0.4,
+        ) as _,
+    ):
+        pass
+
+
 def test_splitting_ops_dynamic():
     # Default config
     config = VllmConfig()
@@ -216,12 +234,14 @@ def test_splitting_ops_dynamic():
         compilation_config=CompilationConfig(
             mode=CompilationMode.VLLM_COMPILE,
             use_inductor_graph_partition=True,
-            splitting_ops=["vllm::unified_attention"],
+            splitting_ops=["vllm::unified_attention_with_output"],
         )
     )
     # with inductor partition we use splitting_ops directly for
     # partition rules
-    assert config.compilation_config.splitting_ops == ["vllm::unified_attention"]
+    assert config.compilation_config.splitting_ops == [
+        "vllm::unified_attention_with_output"
+    ]
 
     # When attn_fusion pass enabled.
     config = VllmConfig(
@@ -281,7 +301,7 @@ def test_moe_splitting_ops_deepep_ht_inductor_partition():
             mode=CompilationMode.VLLM_COMPILE,
             use_inductor_graph_partition=True,
             splitting_ops=[
-                "vllm::unified_attention",
+                "vllm::unified_attention_with_output",
                 "vllm::moe_forward",
                 "vllm::moe_forward_shared",
             ],
@@ -289,7 +309,7 @@ def test_moe_splitting_ops_deepep_ht_inductor_partition():
     )
     splitting_ops = config.compilation_config.splitting_ops
     assert splitting_ops == [
-        "vllm::unified_attention",
+        "vllm::unified_attention_with_output",
         "vllm::moe_forward",
         "vllm::moe_forward_shared",
     ]
@@ -412,7 +432,7 @@ def test_cudagraph_sizes_post_init(
 
     with (
         ctx,
-        patch("vllm.config.parallel.cuda_device_count_stateless", return_value=tp_size),
+        patch.object(current_platform, "device_count", return_value=tp_size),
     ):
         kwargs = {}
         if cudagraph_capture_sizes is not None:
@@ -454,7 +474,7 @@ def test_cached_compilation_config(default_vllm_config):
     from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 
     dtype = torch.bfloat16
-    device = torch.device("cuda:0")
+    device = torch.device(f"{DEVICE_TYPE}:0")
     batch_size, num_qo_heads, head_size = 8, 16, 128
 
     # access and cache default compilation config
@@ -476,7 +496,7 @@ def test_cached_compilation_config(default_vllm_config):
         query_quant = QuantFP8(static=True, group_shape=GroupShape.PER_TENSOR)
         query_quant = torch.compile(query_quant)
 
-        _q_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
+        _q_scale = torch.tensor(1.0, dtype=torch.float32, device=DEVICE_TYPE)
         query = torch.randn(
             batch_size, num_qo_heads * head_size, dtype=dtype, device=device
         )
@@ -611,6 +631,24 @@ def test_inductor_asserts_enabled_in_debug(monkeypatch):
         assert config.inductor_compile_config.get("size_asserts") is True
         assert config.inductor_compile_config.get("alignment_asserts") is True
         assert config.inductor_compile_config.get("scalar_asserts") is True
+
+
+def test_get_inductor_factors_includes_configs():
+    """Changing inductor or functorch config must change the cache key factors."""
+    from torch._functorch import config as functorch_config
+    from torch._inductor import config as inductor_config
+
+    from vllm.compilation.compiler_interface import get_inductor_factors
+
+    baseline = get_inductor_factors()
+
+    with inductor_config.patch("max_autotune", not inductor_config.max_autotune):
+        patched = get_inductor_factors()
+    assert baseline != patched, "inductor config change was not reflected"
+
+    with functorch_config.patch("donated_buffer", not functorch_config.donated_buffer):
+        patched = get_inductor_factors()
+    assert baseline != patched, "functorch config change was not reflected"
 
 
 def test_inductor_asserts_user_override(monkeypatch):

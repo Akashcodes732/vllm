@@ -324,9 +324,9 @@ def _selective_state_update_cuda(
     A,
     B,
     C,
-    D=None,
+    D,
+    dt_bias,
     z=None,
-    dt_bias=None,
     dt_softplus=False,
     state_batch_indices=None,
     dst_state_batch_indices=None,
@@ -375,11 +375,11 @@ def _selective_state_update_cuda(
         B = B.unsqueeze(1)
     if C.dim() == 2:
         C = C.unsqueeze(1)
-    if D is not None and D.dim() == 1:
+    if D.dim() == 1:
         D = D.unsqueeze(0)
     if z is not None and z.dim() == 2:
         z = z.unsqueeze(1)
-    if dt_bias is not None and dt_bias.dim() == 1:
+    if dt_bias.dim() == 1:
         dt_bias = dt_bias.unsqueeze(0)
     if out.dim() == 2:
         out = out.unsqueeze(1)
@@ -411,12 +411,10 @@ def _selective_state_update_cuda(
     assert nheads % ngroups == 0, "nheads must be divisible by ngroups"
     assert B.shape == (batch, ngroups, dstate)
     assert C.shape == B.shape
-    if D is not None:
-        assert D.shape == (nheads, dim)
+    assert D.shape == (nheads, dim)
     if z is not None:
         assert z.shape == x.shape
-    if dt_bias is not None:
-        assert dt_bias.shape == (nheads, dim)
+    assert dt_bias.shape == (nheads, dim)
     if state_batch_indices is not None:
         assert state_batch_indices.shape[0] >= N
         assert state_batch_indices.shape[1] >= max_seqlen
@@ -530,7 +528,8 @@ def _selective_state_update_cuda(
             dt.stride(0),
             dt.stride(1),
             dt.stride(2),
-            *(dt_bias.stride(0), dt_bias.stride(1)) if dt_bias is not None else 0,
+            dt_bias.stride(0),
+            dt_bias.stride(1),
             A.stride(0),
             A.stride(1),
             A.stride(2),
@@ -540,7 +539,8 @@ def _selective_state_update_cuda(
             C.stride(0),
             C.stride(1),
             C.stride(2),
-            *(D.stride(0), D.stride(1)) if D is not None else 0,
+            D.stride(0),
+            D.stride(1),
             z_strides[0],
             z_strides[1],
             z_strides[2],
