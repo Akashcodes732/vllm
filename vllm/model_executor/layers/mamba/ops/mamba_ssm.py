@@ -8,12 +8,9 @@ import torch
 from packaging import version
 
 from vllm import _custom_ops as ops
-from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.mamba.ops.triton_helpers import fast_exp
 from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-
-from .cpu_fallbacks import _selective_state_update_cpu
 
 TRITON3 = HAS_TRITON and (version.parse(triton.__version__) >= version.parse("3.0.0"))
 
@@ -685,20 +682,74 @@ def selective_scan_fn(
         return z  # output written inplace to z
 
 
-@CustomOp.register("selective_state_update")
-class SelectiveStateUpdateOp(CustomOp):
-    def forward_native(self, *args, **kwargs):
-        return _selective_state_update_cpu(*args, **kwargs)
 
-    def forward_cpu(self, *args, **kwargs):
-        return _selective_state_update_cpu(*args, **kwargs)
+def selective_state_update(
+    state,
+    x,
+    dt,
+    A,
+    B,
+    C,
+    D=None,
+    z=None,
+    dt_bias=None,
+    dt_softplus=False,
+    state_batch_indices=None,
+    dst_state_batch_indices=None,
+    null_block_id=NULL_BLOCK_ID,
+    out=None,
+    num_accepted_tokens=None,
+    cu_seqlens=None,
+    is_blackwell=False,
+    enable_stochastic_rounding=False,
+    cache_philox_rounds=0,
+):
+    """Dispatch selective_state_update to CPU C++ kernel or CUDA Triton kernel."""
+    # Ensure out tensor exists
+    if out is None:
+        out = torch.empty_like(x if x.dim() == 2 else x)
 
-    def forward_cuda(self, *args, **kwargs):
-        return _selective_state_update_cuda(*args, **kwargs)
+    if x.device.type == "cpu":
+        # Reshape tensors from (batch, dim) -> (batch, 1, dim) if needed
+        # The C++ kernel expects (N, nheads, dim) layout
+        _state = state.unsqueeze(1) if state.dim() == 3 else state
+        _x = x.unsqueeze(1) if x.dim() == 2 else x
+        _dt = dt.unsqueeze(1) if dt.dim() == 2 else dt
+        _A = A.unsqueeze(0) if A.dim() == 2 else A
+        _B = B.unsqueeze(1) if B.dim() == 2 else B
+        _C = C.unsqueeze(1) if C.dim() == 2 else C
+        _D = D.unsqueeze(0) if (D is not None and D.dim() == 1) else D
+        _z = z.unsqueeze(1) if (z is not None and z.dim() == 2) else z
+        _dt_bias = (
+            dt_bias.unsqueeze(0)
+            if (dt_bias is not None and dt_bias.dim() == 1)
+            else dt_bias
+        )
+        _out = out.unsqueeze(1) if out.dim() == 2 else out
+        # state_batch_indices and dst_state_batch_indices are 1D index arrays;
+        # do NOT reshape them.
+        _sbi = state_batch_indices
+        _dsbi = dst_state_batch_indices
+        ops.selective_state_update_cpu(
+            _state, _x, _dt, _A, _B, _C,
+            _D, _z, _dt_bias, dt_softplus,
+            _sbi, _dsbi,
+            null_block_id, _out,
+            num_accepted_tokens, cu_seqlens,
+        )
+        return _out.squeeze(1) if out.dim() == 2 else _out
 
-
-_selective_state_update_op = SelectiveStateUpdateOp()
-
-
-def selective_state_update(*args, **kwargs):
-    return _selective_state_update_op(*args, **kwargs)
+    return _selective_state_update_cuda(
+        state, x, dt, A, B, C,
+        D=D, z=z, dt_bias=dt_bias,
+        dt_softplus=dt_softplus,
+        state_batch_indices=state_batch_indices,
+        dst_state_batch_indices=dst_state_batch_indices,
+        null_block_id=null_block_id,
+        out=out,
+        num_accepted_tokens=num_accepted_tokens,
+        cu_seqlens=cu_seqlens,
+        is_blackwell=is_blackwell,
+        enable_stochastic_rounding=enable_stochastic_rounding,
+        cache_philox_rounds=cache_philox_rounds,
+    )

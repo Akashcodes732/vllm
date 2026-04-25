@@ -8,11 +8,12 @@
 import numpy as np
 import torch
 
-from vllm.model_executor.custom_op import CustomOp
+from vllm import _custom_ops as ops
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 
 from .cpu_fallbacks import _causal_conv1d_fn_cpu, _causal_conv1d_update_cpu
+
 
 
 @triton.jit()
@@ -1248,37 +1249,75 @@ def _causal_conv1d_update_cuda(
     return out.to(original_x_dtype)
 
 
-@CustomOp.register("causal_conv1d_fn")
-class CausalConv1dFnOp(CustomOp):
-    def forward_native(self, *args, **kwargs):
-        return _causal_conv1d_fn_cpu(*args, **kwargs)
-
-    def forward_cpu(self, *args, **kwargs):
-        return _causal_conv1d_fn_cpu(*args, **kwargs)
-
-    def forward_cuda(self, *args, **kwargs):
-        return _causal_conv1d_fn_cuda(*args, **kwargs)
-
-
-@CustomOp.register("causal_conv1d_update")
-class CausalConv1dUpdateOp(CustomOp):
-    def forward_native(self, *args, **kwargs):
-        return _causal_conv1d_update_cpu(*args, **kwargs)
-
-    def forward_cpu(self, *args, **kwargs):
-        return _causal_conv1d_update_cpu(*args, **kwargs)
-
-    def forward_cuda(self, *args, **kwargs):
-        return _causal_conv1d_update_cuda(*args, **kwargs)
-
-
-_causal_conv1d_fn_op = CausalConv1dFnOp()
-_causal_conv1d_update_op = CausalConv1dUpdateOp()
-
-
 def causal_conv1d_fn(*args, **kwargs):
-    return _causal_conv1d_fn_op(*args, **kwargs)
+    """Dispatch causal_conv1d_fn to CPU PyTorch fallback or CUDA Triton kernel."""
+    x = args[0] if args else kwargs.get("x")
+    if x is not None and x.device.type == "cpu":
+        return _causal_conv1d_fn_cpu(*args, **kwargs)
+    return _causal_conv1d_fn_cuda(*args, **kwargs)
 
 
-def causal_conv1d_update(*args, **kwargs):
-    return _causal_conv1d_update_op(*args, **kwargs)
+def causal_conv1d_update(
+    x,
+    conv_state,
+    weight,
+    bias=None,
+    activation=None,
+    conv_state_indices=None,
+    num_accepted_tokens=None,
+    query_start_loc=None,
+    max_query_len=-1,
+    null_block_id=NULL_BLOCK_ID,
+    block_idx_last_scheduled_token=None,
+    initial_state_idx=None,
+    validate_data=False,
+):
+    """Dispatch causal_conv1d_update to CPU C++ kernel or CUDA Triton kernel."""
+    if x.device.type == "cpu":
+        # The C++ kernel handles the standard (non-varlen, non-spec-decoding)
+        # decode path.  Fall back to PyTorch for the complex varlen /
+        # spec-decoding paths.
+        if query_start_loc is not None or num_accepted_tokens is not None:
+            return _causal_conv1d_update_cpu(
+                x,
+                conv_state,
+                weight,
+                bias=bias,
+                activation=activation,
+                conv_state_indices=conv_state_indices,
+                query_start_loc=query_start_loc,
+            )
+        # Determine activation string
+        act_str = None
+        if isinstance(activation, bool):
+            act_str = "silu" if activation else None
+        elif activation is not None:
+            act_str = activation
+
+        pad_slot_id = int(NULL_BLOCK_ID)
+        return ops.causal_conv1d_update_cpu(
+            x,
+            conv_state,
+            weight,
+            bias,
+            act_str,
+            conv_state_indices,
+            None,  # query_start_loc
+            pad_slot_id,
+        )
+
+    return _causal_conv1d_update_cuda(
+        x,
+        conv_state,
+        weight,
+        bias=bias,
+        activation=activation,
+        conv_state_indices=conv_state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+        query_start_loc=query_start_loc,
+        max_query_len=max_query_len,
+        null_block_id=null_block_id,
+        block_idx_last_scheduled_token=block_idx_last_scheduled_token,
+        initial_state_idx=initial_state_idx,
+        validate_data=validate_data,
+    )
