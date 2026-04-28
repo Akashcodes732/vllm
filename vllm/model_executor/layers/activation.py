@@ -129,10 +129,12 @@ class SiluAndMul(CustomOp):
 
     def __init__(self, *, compile_native: bool = True):
         super().__init__(compile_native=compile_native)
-        if current_platform.is_cuda_alike() or current_platform.is_xpu():
+        if (
+            current_platform.is_cuda_alike()
+            or current_platform.is_cpu()
+            or current_platform.is_xpu()
+        ):
             self.op = torch.ops._C.silu_and_mul
-        elif current_platform.is_cpu():
-            self._forward_method = self.forward_native
 
     @staticmethod
     def forward_native(x: torch.Tensor) -> torch.Tensor:
@@ -148,6 +150,9 @@ class SiluAndMul(CustomOp):
         return out
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_cuda(x)
+
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_cuda(x)
 
 
@@ -329,6 +334,9 @@ class GeluAndMul(CustomOp):
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_cuda(x)
 
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_cuda(x)
+
     def extra_repr(self) -> str:
         return f"approximate={repr(self.approximate)}"
 
@@ -430,6 +438,9 @@ class NewGELU(CustomOp):
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_cuda(x)
 
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_cuda(x)
+
 
 # --8<-- [start:gelu_fast]
 @CustomOp.register("gelu_fast")
@@ -457,6 +468,8 @@ class FastGELU(CustomOp):
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_cuda(x)
 
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_cuda(x)
 
 # --8<-- [start:quick_gelu]
 @CustomOp.register("quick_gelu")
@@ -483,6 +496,9 @@ class QuickGELU(CustomOp):
         return out
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_cuda(x)
+
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_cuda(x)
 
 
@@ -723,3 +739,4 @@ def get_act_and_mul_fn(act_fn_name: str) -> nn.Module:
         raise ValueError(f"Activation function {act_fn_name!r} is not supported.")
 
     return _ACTIVATION_AND_MUL_REGISTRY[act_fn_name]
+
