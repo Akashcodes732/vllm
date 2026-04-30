@@ -153,7 +153,9 @@ class SiluAndMul(CustomOp):
         return self.forward_cuda(x)
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_cuda(x)
+        if current_platform.get_cpu_architecture() == CpuArchEnum.POWER:
+            return self.forward_cuda(x)
+        return self.forward_native(x)
 
 
 # --8<-- [start:mul_and_silu]
@@ -335,7 +337,9 @@ class GeluAndMul(CustomOp):
         return self.forward_cuda(x)
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_cuda(x)
+        if current_platform.get_cpu_architecture() == CpuArchEnum.POWER:
+            return self.forward_cuda(x)
+        return self.forward_native(x)
 
     def extra_repr(self) -> str:
         return f"approximate={repr(self.approximate)}"
@@ -439,7 +443,9 @@ class NewGELU(CustomOp):
         return self.forward_cuda(x)
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_cuda(x)
+        if current_platform.get_cpu_architecture() == CpuArchEnum.POWER:
+            return self.forward_cuda(x)
+        return self.forward_native(x)
 
 
 # --8<-- [start:gelu_fast]
@@ -469,7 +475,9 @@ class FastGELU(CustomOp):
         return self.forward_cuda(x)
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_cuda(x)
+        if current_platform.get_cpu_architecture() == CpuArchEnum.POWER:
+            return self.forward_cuda(x)
+        return self.forward_native(x)
 
 # --8<-- [start:quick_gelu]
 @CustomOp.register("quick_gelu")
@@ -499,7 +507,9 @@ class QuickGELU(CustomOp):
         return self.forward_cuda(x)
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_cuda(x)
+        if current_platform.get_cpu_architecture() == CpuArchEnum.POWER:
+            return self.forward_cuda(x)
+        return self.forward_native(x)
 
 
 # --8<-- [start:relu2]

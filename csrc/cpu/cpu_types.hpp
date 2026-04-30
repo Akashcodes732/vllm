@@ -6,8 +6,8 @@
 #if defined(__x86_64__)
   // x86 implementation
   #include "cpu_types_x86.hpp"
-#elif defined(__POWER9_VECTOR__) || defined(__powerpc__) || defined(__powerpc64__)
-  // ppc implementation
+#elif defined(__powerpc__) 
+// ppc implementation
 #pragma message("power pc triggered \n\n\n")
   #include "cpu_types_vsx.hpp"
 #elif defined(__s390x__)
