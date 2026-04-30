@@ -12,11 +12,9 @@ namespace {
 // covering the lower 16 and upper 16 positions.
 // For FP8: both halves come from a single BF16Vec32 dequant of 32 bytes.
 // For BF16/FP16/FP32: two separate vector loads at ptr and ptr+16.
-// Note: FP8 KV cache is not supported on PowerPC (VSX).
 template <typename kv_cache_t>
 FORCE_INLINE std::pair<vec_op::FP32Vec16, vec_op::FP32Vec16> load_b_pair_vec(
     const kv_cache_t* ptr) {
-#if !defined(__powerpc__)
   if constexpr (std::is_same_v<kv_cache_t, c10::Float8_e4m3fn>) {
     // BF16 container, but values are in the FP16 exponent range (bias 15 not
     // 127).
@@ -27,9 +25,7 @@ FORCE_INLINE std::pair<vec_op::FP32Vec16, vec_op::FP32Vec16> load_b_pair_vec(
     vec_op::BF16Vec32 bf16_b_reg(reinterpret_cast<const uint8_t*>(ptr),
                                  vec_op::fp8_e5m2_tag{});
     return {vec_op::FP32Vec16(bf16_b_reg, 0), vec_op::FP32Vec16(bf16_b_reg, 1)};
-  } else
-#endif
-  {
+  } else {
     using load_vec_t = typename VecTypeTrait<kv_cache_t>::vec_t;
     return std::make_pair(vec_op::FP32Vec16(load_vec_t(ptr)),
                           vec_op::FP32Vec16(load_vec_t(ptr + 16)));
