@@ -54,6 +54,7 @@ struct Counter {
 };
 
 inline int64_t get_available_l2_size() {
+#if defined(__s390x__) || defined(__powerpc__)
   static int64_t size = []() {
     uint32_t l2_cache_size = 0;
     auto caps = at::cpu::get_cpu_capabilities();
@@ -68,11 +69,19 @@ inline int64_t get_available_l2_size() {
       }
     }
     if (l2_cache_size == 0) {
-      l2_cache_size = 256 * 1024;  // Default fallback: 256KB
+      l2_cache_size = 256 * 1024;
     }
     return static_cast<int64_t>(l2_cache_size) >> 1;  // use 50% of L2 cache
   }();
   return size;
+#else
+  static int64_t size = []() {
+    auto caps = at::cpu::get_cpu_capabilities();
+    const uint32_t l2_cache_size = caps.at("l2_cache_size").toInt();
+    return l2_cache_size >> 1;  // use 50% of L2 cache
+  }();
+  return size;
+#endif
 }
 
 template <int32_t alignment_v, typename T>
