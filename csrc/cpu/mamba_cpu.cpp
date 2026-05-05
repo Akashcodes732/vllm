@@ -183,6 +183,10 @@ void selective_state_update_cpu_impl(
   int64_t stride_BC_g = B_f32.stride(1);
   int64_t stride_out_n = out_f32.stride(0);
   int64_t stride_out_h = out_f32.stride(1);
+  int64_t stride_A_h = (A_f32.size(0) == 1) ? 0 : A_f32.stride(0);
+  int64_t stride_D_h = has_D ? ((D_f32.size(0) == 1) ? 0 : D_f32.stride(0)) : 0;
+  int64_t stride_dtbias_h =
+      has_dt_bias ? ((dtbias_f32.size(0) == 1) ? 0 : dtbias_f32.stride(0)) : 0;
 
   // Optional pointer helpers
   const int32_t* sbi_ptr = nullptr;
@@ -211,11 +215,11 @@ void selective_state_update_cpu_impl(
   mamba_cpu::selective_state_update_kernel(
       state_f32.data_ptr<float>(), stride_state_n, stride_state_h,
       stride_state_d, x_f32.data_ptr<float>(), dt_f32.data_ptr<float>(),
-      stride_xdt_n, stride_xdt_h, A_f32.data_ptr<float>(),
+      stride_xdt_n, stride_xdt_h, A_f32.data_ptr<float>(), stride_A_h,
       B_f32.data_ptr<float>(), C_f32.data_ptr<float>(), stride_BC_n,
-      stride_BC_g, has_D ? D_f32.data_ptr<float>() : nullptr,
+      stride_BC_g, has_D ? D_f32.data_ptr<float>() : nullptr, stride_D_h,
       has_z ? z_f32.data_ptr<float>() : nullptr,
-      has_dt_bias ? dtbias_f32.data_ptr<float>() : nullptr,
+      has_dt_bias ? dtbias_f32.data_ptr<float>() : nullptr, stride_dtbias_h,
       out_f32.data_ptr<float>(), stride_out_n, stride_out_h, sbi_ptr, dsbi_ptr,
       static_cast<int32_t>(null_block_id), nat_ptr, csl_ptr, N, nheads, ngroups,
       dim, dstate, dt_softplus);

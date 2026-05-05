@@ -57,25 +57,24 @@ inline void causal_conv1d_update_kernel(
       for (int64_t d = 0; d < dim; ++d) {
         float x_val = x_b[d * seqlen];
 
-        // Roll state left, append x_val at the end
         float* sd = s + d * state_len;  // state for channel d
-        // shift left: sd[0..state_len-2] = sd[1..state_len-1]
-        // use memmove for contiguous float array
+
+        // Compute the dot product with weight[d, :] = weight + d*width
+        const float* w = weight_ptr + d * width;
+        float acc = (bias_ptr != nullptr) ? bias_ptr[d] : 0.0f;
+        
+        // The convolution window is [sd[0], ..., sd[state_len-1], x_val]
+        for (int64_t k = 0; k < state_len; ++k) {
+          acc += w[k] * sd[k];
+        }
+        acc += w[state_len] * x_val;
+
+        // Roll state left, append x_val at the end
         if (state_len > 1) {
           std::memmove(sd, sd + 1, (state_len - 1) * sizeof(float));
         }
-        sd[state_len - 1] = x_val;
-
-        // Dot product with weight[d, :] = weight + d*width
-        const float* w = weight_ptr + d * width;
-        float acc = (bias_ptr != nullptr) ? bias_ptr[d] : 0.0f;
-        // state_len == width - 1, so the window is sd[0..state_len-1]
-        // and weight[d, 0..width-1] aligns as: w[0]*sd[0] + ... +
-        // w[width-1]*sd[state_len-1] because the new x_val already sits at
-        // sd[state_len-1]
-        for (int64_t k = 0; k < width; ++k) {
-          // sd holds [old_1, ..., old_{width-2}, x_new] after the memmove
-          acc += w[k] * sd[k];
+        if (state_len > 0) {
+          sd[state_len - 1] = x_val;
         }
 
         if (do_silu) {
@@ -121,17 +120,17 @@ inline void selective_state_update_kernel(
     int64_t stride_xdt_n,  // stride along N dim
     int64_t stride_xdt_h,  // stride along nheads dim
     // A: [nheads, dim, dstate]
-    const float* __restrict__ A_ptr,
+    const float* __restrict__ A_ptr, int64_t stride_A_h,
     // B, C: [N, ngroups, dstate]
     const float* __restrict__ B_ptr, const float* __restrict__ C_ptr,
     int64_t stride_BC_n,  // stride along N dim
     int64_t stride_BC_g,  // stride along ngroups dim
     // D: [nheads, dim] or nullptr
-    const float* __restrict__ D_ptr,
+    const float* __restrict__ D_ptr, int64_t stride_D_h,
     // z: [N, nheads, dim] or nullptr
     const float* __restrict__ z_ptr,
     // dt_bias: [nheads, dim] or nullptr
-    const float* __restrict__ dt_bias_ptr,
+    const float* __restrict__ dt_bias_ptr, int64_t stride_dtbias_h,
     // out: [N, nheads, dim]  – written in place
     float* __restrict__ out_ptr, int64_t stride_out_n, int64_t stride_out_h,
     // state_batch_indices: [N] or nullptr (use seq_idx)
@@ -198,10 +197,10 @@ inline void selective_state_update_kernel(
         const float* dt_h = dt_tok + h * stride_xdt_h;
         const float* B_g = B_tok + g * stride_BC_g;
         const float* C_g = C_tok + g * stride_BC_g;
-        const float* A_h = A_ptr + h * dim * dstate;
+        const float* A_h = A_ptr + h * stride_A_h;
         const float* dt_bias_h =
-            (dt_bias_ptr != nullptr) ? dt_bias_ptr + h * dim : nullptr;
-        const float* D_h = (D_ptr != nullptr) ? D_ptr + h * dim : nullptr;
+            (dt_bias_ptr != nullptr) ? dt_bias_ptr + h * stride_dtbias_h : nullptr;
+        const float* D_h = (D_ptr != nullptr) ? D_ptr + h * stride_D_h : nullptr;
         const float* z_h =
             (z_ptr != nullptr)
                 ? z_ptr + token_idx * stride_xdt_n + h * stride_xdt_h

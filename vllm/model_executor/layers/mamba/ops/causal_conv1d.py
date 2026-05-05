@@ -1290,6 +1290,15 @@ def causal_conv1d_update(
         elif activation is not None:
             act_str = activation
 
+        _conv_state_indices = conv_state_indices
+        if _conv_state_indices is not None and _conv_state_indices.dim() == 2:
+            if initial_state_idx is not None:
+                _conv_state_indices = _conv_state_indices.gather(
+                    1, initial_state_idx.unsqueeze(1)
+                ).squeeze(1)
+            else:
+                _conv_state_indices = _conv_state_indices[:, 0]
+
         pad_slot_id = int(NULL_BLOCK_ID)
         return ops.causal_conv1d_update_cpu(
             x,
@@ -1297,7 +1306,7 @@ def causal_conv1d_update(
             weight,
             bias,
             act_str,
-            conv_state_indices,
+            _conv_state_indices,
             None,  # query_start_loc
             pad_slot_id,
         )
