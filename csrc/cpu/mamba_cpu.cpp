@@ -10,6 +10,8 @@
 #include <torch/library.h>
 #include <c10/util/Optional.h>
 
+#include "cpu_types.hpp"
+
 // ---------------------------------------------------------------------------
 // causal_conv1d_update
 //
@@ -221,5 +223,4 @@ void selective_state_update_cpu_impl(
   });
 
   out.copy_(out_f32.to(out.scalar_type()));
-}
 }
