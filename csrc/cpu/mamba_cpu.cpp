@@ -137,16 +137,15 @@ void selective_state_update_cpu_impl(
     const c10::optional<at::Tensor>& cu_seqlens            // (N+1,) int32
 ) {
   // ------------------------------------------------------------------
-  // Work in float32
+  // Dimensions and Setup
   // ------------------------------------------------------------------
-  at::Tensor state_f32 = state.to(at::kFloat);
+  // Work in float32 for parameters, but allow state to be in original dtype
   at::Tensor x_f32 = x.to(at::kFloat).contiguous();
   at::Tensor dt_f32 = dt.to(at::kFloat).contiguous();
   at::Tensor A_f32 = A.to(at::kFloat).contiguous();
   at::Tensor B_f32 = B.to(at::kFloat).contiguous();
   at::Tensor C_f32 = C.to(at::kFloat).contiguous();
   at::Tensor out_f32 = at::zeros_like(x_f32);  // (N, nheads, dim)
-  state_f32 = state_f32.contiguous();
 
   at::Tensor D_f32, z_f32, dtbias_f32;
   bool has_D = D.has_value() && D.value().defined();
@@ -156,14 +155,9 @@ void selective_state_update_cpu_impl(
   if (has_z) z_f32 = z.value().to(at::kFloat).contiguous();
   if (has_dt_bias) dtbias_f32 = dt_bias.value().to(at::kFloat).contiguous();
 
-  // ------------------------------------------------------------------
-  // Dimensions
-  // ------------------------------------------------------------------
-  //  state_f32: (nstates, nheads, dim, dstate)
-  int64_t nstates = state_f32.size(0);
-  int64_t nheads = state_f32.size(1);
-  int64_t dim = state_f32.size(2);
-  int64_t dstate = state_f32.size(3);
+  int64_t nheads = state.size(1);
+  int64_t dim = state.size(2);
+  int64_t dstate = state.size(3);
   int64_t ngroups = B_f32.size(1);
 
   int64_t N;
@@ -173,10 +167,10 @@ void selective_state_update_cpu_impl(
     N = x_f32.size(0);
   }
 
-  // Strides (all contiguous after .contiguous())
-  int64_t stride_state_n = state_f32.stride(0);
-  int64_t stride_state_h = state_f32.stride(1);
-  int64_t stride_state_d = state_f32.stride(2);
+  // Strides
+  int64_t stride_state_n = state.stride(0);
+  int64_t stride_state_h = state.stride(1);
+  int64_t stride_state_d = state.stride(2);
   int64_t stride_xdt_n = x_f32.stride(0);
   int64_t stride_xdt_h = x_f32.stride(1);
   int64_t stride_BC_n = B_f32.stride(0);
@@ -212,19 +206,20 @@ void selective_state_update_cpu_impl(
     csl_ptr = csl_int.data_ptr<int32_t>();
   }
 
-  mamba_cpu::selective_state_update_kernel(
-      state_f32.data_ptr<float>(), stride_state_n, stride_state_h,
-      stride_state_d, x_f32.data_ptr<float>(), dt_f32.data_ptr<float>(),
-      stride_xdt_n, stride_xdt_h, A_f32.data_ptr<float>(), stride_A_h,
-      B_f32.data_ptr<float>(), C_f32.data_ptr<float>(), stride_BC_n,
-      stride_BC_g, has_D ? D_f32.data_ptr<float>() : nullptr, stride_D_h,
-      has_z ? z_f32.data_ptr<float>() : nullptr,
-      has_dt_bias ? dtbias_f32.data_ptr<float>() : nullptr, stride_dtbias_h,
-      out_f32.data_ptr<float>(), stride_out_n, stride_out_h, sbi_ptr, dsbi_ptr,
-      static_cast<int32_t>(null_block_id), nat_ptr, csl_ptr, N, nheads, ngroups,
-      dim, dstate, dt_softplus);
+  VLLM_DISPATCH_FLOATING_TYPES(state.scalar_type(), "selective_state_update_kernel", [&] {
+    mamba_cpu::selective_state_update_kernel<scalar_t>(
+        state.data_ptr<scalar_t>(), stride_state_n, stride_state_h,
+        stride_state_d, x_f32.data_ptr<float>(), dt_f32.data_ptr<float>(),
+        stride_xdt_n, stride_xdt_h, A_f32.data_ptr<float>(), stride_A_h,
+        B_f32.data_ptr<float>(), C_f32.data_ptr<float>(), stride_BC_n,
+        stride_BC_g, has_D ? D_f32.data_ptr<float>() : nullptr, stride_D_h,
+        has_z ? z_f32.data_ptr<float>() : nullptr,
+        has_dt_bias ? dtbias_f32.data_ptr<float>() : nullptr, stride_dtbias_h,
+        out_f32.data_ptr<float>(), stride_out_n, stride_out_h, sbi_ptr, dsbi_ptr,
+        static_cast<int32_t>(null_block_id), nat_ptr, csl_ptr, N, nheads, ngroups,
+        dim, dstate, dt_softplus);
+  });
 
-  // Write back
-  state.copy_(state_f32.to(state.scalar_type()));
   out.copy_(out_f32.to(out.scalar_type()));
+}
 }

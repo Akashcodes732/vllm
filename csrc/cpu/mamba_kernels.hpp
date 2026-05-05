@@ -109,9 +109,10 @@ inline void causal_conv1d_update_kernel(
 // Parameters match those in the Python fallback _selective_state_update_cpu
 // but receive raw pointers + sizes.
 // ---------------------------------------------------------------------------
+template <typename scalar_t>
 inline void selective_state_update_kernel(
     // state: [nstates, nheads, dim, dstate]  – modified in place
-    float* __restrict__ state_ptr,
+    scalar_t* __restrict__ state_ptr,
     int64_t stride_state_n,  // stride along nstates dim
     int64_t stride_state_h,  // stride along nheads dim
     int64_t stride_state_d,  // stride along dim dim
@@ -178,9 +179,8 @@ inline void selective_state_update_kernel(
       state_write_idx = -1;  // written per-token inside the loop
     }
 
-    // Per-sequence state buffer: copy to float32 scratch
-    // We work directly on state_ptr (it's already float32 at this layer)
-    float* s = state_ptr + state_read_idx * stride_state_n;
+    // Per-sequence state buffer
+    scalar_t* s = state_ptr + state_read_idx * stride_state_n;
 
     for (int64_t t = 0; t < seq_len; ++t) {
       int64_t token_idx = bos + t;
@@ -191,6 +191,7 @@ inline void selective_state_update_kernel(
       const float* C_tok = C_ptr + token_idx * stride_BC_n;
       float* out_tok = out_ptr + token_idx * stride_out_n;
 
+#pragma omp parallel for
       for (int64_t h = 0; h < nheads; ++h) {
         int64_t g = h / nheads_per_group;
         const float* x_h = x_tok + h * stride_xdt_h;
@@ -206,7 +207,7 @@ inline void selective_state_update_kernel(
                 ? z_ptr + token_idx * stride_xdt_n + h * stride_xdt_h
                 : nullptr;
         float* out_h = out_tok + h * stride_out_h;
-        float* s_h = s + h * stride_state_h;
+        scalar_t* s_h = s + h * stride_state_h;
 
         for (int64_t d = 0; d < dim; ++d) {
           float x_val = x_h[d];
@@ -214,24 +215,29 @@ inline void selective_state_update_kernel(
           if (dt_bias_h != nullptr) dt_val += dt_bias_h[d];
           if (dt_softplus) {
             // log1p(exp(dt)) — numerically stable
-            dt_val = (dt_val <= 20.0f) ? std::log1p(std::exp(dt_val)) : dt_val;
+            dt_val = (dt_val <= 20.0f) ? std::log1pf(std::expf(dt_val)) : dt_val;
           }
 
           float out_val = 0.0f;
-          float* s_hd = s_h + d * dstate;
+          scalar_t* s_hd = s_h + d * dstate;
           const float* A_hd = A_h + d * dstate;
           for (int64_t n = 0; n < dstate; ++n) {
-            float dA = std::exp(A_hd[n] * dt_val);
+            float dA = std::expf(A_hd[n] * dt_val);
             float dBx = B_g[n] * x_val * dt_val;
-            float s_new = s_hd[n] * dA + dBx;
-            s_hd[n] = s_new;
+            float s_old = static_cast<float>(s_hd[n]);
+            float s_new = s_old * dA + dBx;
+            s_hd[n] = static_cast<scalar_t>(s_new);
             out_val += s_new * C_g[n];
           }
 
           if (D_h != nullptr) out_val += x_val * D_h[d];
           if (z_h != nullptr) {
             float z_val = z_h[d];
-            out_val *= z_val / (1.0f + std::exp(-z_val));
+            // Stable SiLU: z * sigmoid(z)
+            float sigmoid_z = (z_val >= 0) ? 
+                1.0f / (1.0f + std::expf(-z_val)) : 
+                std::expf(z_val) / (1.0f + std::expf(z_val));
+            out_val *= z_val * sigmoid_z;
           }
           out_h[d] = out_val;
         }
@@ -241,9 +247,9 @@ inline void selective_state_update_kernel(
       if (num_accepted_tokens != nullptr &&
           dst_state_batch_indices != nullptr) {
         int64_t token_dst_idx = dst_state_batch_indices[seq_idx * seq_len + t];
-        if (token_dst_idx != null_block_id) {
-          float* dst_s = state_ptr + token_dst_idx * stride_state_n;
-          std::memcpy(dst_s, s, nheads * stride_state_h * sizeof(float));
+        if (token_dst_idx != null_block_id && token_dst_idx != state_read_idx) {
+          scalar_t* dst_s = state_ptr + token_dst_idx * stride_state_n;
+          std::memmove(dst_s, s, nheads * stride_state_h * sizeof(scalar_t));
         }
       }
     }
@@ -251,8 +257,8 @@ inline void selective_state_update_kernel(
     // Write final state
     if (num_accepted_tokens == nullptr && state_write_idx != null_block_id &&
         state_write_idx != state_read_idx) {
-      float* dst_s = state_ptr + state_write_idx * stride_state_n;
-      std::memcpy(dst_s, s, nheads * stride_state_h * sizeof(float));
+      scalar_t* dst_s = state_ptr + state_write_idx * stride_state_n;
+      std::memmove(dst_s, s, nheads * stride_state_h * sizeof(scalar_t));
     }
   }
 }
