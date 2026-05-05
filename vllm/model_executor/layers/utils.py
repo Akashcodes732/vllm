@@ -236,9 +236,7 @@ def dispatch_cpu_unquantized_gemm(
     # Skip CPU GEMM dispatch for non-2D weights (e.g. MoE 3D expert weights).
     # These layers are handled by their own specialized methods.
     if layer.weight.dim() != 2:
-        layer.cpu_linear = lambda x, weight, bias: torch.nn.functional.linear(
-            x, weight, bias
-        )
+        layer.cpu_linear = torch.nn.functional.linear
         return
 
     N, K = layer.weight.size()
@@ -298,9 +296,7 @@ def dispatch_cpu_unquantized_gemm(
             )
 
     # fallback case
-    layer.cpu_linear = lambda x, weight, bias: torch.nn.functional.linear(
-        x, weight, bias
-    )
+    layer.cpu_linear = torch.nn.functional.linear
 
 
 def cpu_unquantized_gemm(
