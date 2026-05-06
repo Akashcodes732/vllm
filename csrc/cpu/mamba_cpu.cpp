@@ -82,28 +82,43 @@ void selective_state_update_cpu_impl(
     const c10::optional<at::Tensor>& num_accepted_tokens,
     const c10::optional<at::Tensor>& cu_seqlens
 ) {
-  // Optimization: No full-tensor conversions to float32 here.
-  // We pass original dtypes and let the kernel handle it via vec_op.
+  // To avoid "expected scalar type but found" errors, we must ensure all
+  // input/parameter tensors match the input_t we dispatch on.
+  at::ScalarType input_type = x.scalar_type();
   
-  int64_t nheads = state.size(1);
-  int64_t dim = state.size(2);
-  int64_t dstate = state.size(3);
-  int64_t N = x.size(0);
-  int64_t ngroups = B.size(1);
+  // Convert state to input_type to ensure type consistency
+  at::Tensor state_in = state.to(input_type);
+  
+  // No-op if already matching the correct type.
+  at::Tensor dt_in = dt.to(input_type);
+  at::Tensor A_in = A.to(input_type);
+  at::Tensor B_in = B.to(input_type);
+  at::Tensor C_in = C.to(input_type);
+  
+  at::Tensor D_in, z_in, dt_bias_in;
+  if (D.has_value() && D.value().defined()) D_in = D.value().to(input_type);
+  if (z.has_value() && z.value().defined()) z_in = z.value().to(input_type);
+  if (dt_bias.has_value() && dt_bias.value().defined()) dt_bias_in = dt_bias.value().to(input_type);
 
-  // Strides (crucial for correctness)
-  int64_t stride_state_n = state.stride(0);
-  int64_t stride_state_h = state.stride(1);
-  int64_t stride_state_d = state.stride(2);
+  int64_t nheads = state_in.size(1);
+  int64_t dim = state_in.size(2);
+  int64_t dstate = state_in.size(3);
+  int64_t N = x.size(0);
+  int64_t ngroups = B_in.size(1);
+
+  // Strides
+  int64_t stride_state_n = state_in.stride(0);
+  int64_t stride_state_h = state_in.stride(1);
+  int64_t stride_state_d = state_in.stride(2);
   int64_t stride_xdt_n = x.stride(0);
   int64_t stride_xdt_h = x.stride(1);
-  int64_t stride_A_h = A.stride(0);
-  int64_t stride_BC_n = B.stride(0);
-  int64_t stride_BC_g = B.stride(1);
+  int64_t stride_A_h = A_in.stride(0);
+  int64_t stride_BC_n = B_in.stride(0);
+  int64_t stride_BC_g = B_in.stride(1);
   int64_t stride_out_n = out.stride(0);
   int64_t stride_out_h = out.stride(1);
-  int64_t stride_D_h = D.has_value() ? D.value().stride(0) : 0;
-  int64_t stride_dtbias_h = dt_bias.has_value() ? dt_bias.value().stride(0) : 0;
+  int64_t stride_D_h = D_in.defined() ? D_in.stride(0) : 0;
+  int64_t stride_dtbias_h = dt_bias_in.defined() ? dt_bias_in.stride(0) : 0;
 
   // Optional pointers
   const int32_t* sbi_ptr = state_batch_indices.has_value() ? state_batch_indices.value().data_ptr<int32_t>() : nullptr;
@@ -111,28 +126,26 @@ void selective_state_update_cpu_impl(
   const int32_t* nat_ptr = num_accepted_tokens.has_value() ? num_accepted_tokens.value().data_ptr<int32_t>() : nullptr;
   const int32_t* csl_ptr = cu_seqlens.has_value() ? cu_seqlens.value().data_ptr<int32_t>() : nullptr;
 
-  // out is often bfloat16, but kernel math is float32.
-  // We use a temporary float32 buffer per token if needed, or just convert at the end.
-  // For simplicity and correctness, we use a float32 out buffer and copy back.
+  // We write to a temporary float32 buffer to ensure high-precision accumulation
+  // before copying back to the original out tensor.
   at::Tensor out_f32 = at::empty_like(out, at::kFloat);
 
-  VLLM_DISPATCH_FLOATING_TYPES(state.scalar_type(), "ssu_state", [&] {
-    using state_t = scalar_t;
-    VLLM_DISPATCH_FLOATING_TYPES(x.scalar_type(), "ssu_input", [&] {
-      using input_t = scalar_t;
-      mamba_cpu::selective_state_update_kernel<state_t, input_t>(
-          state.data_ptr<state_t>(), stride_state_n, stride_state_h, stride_state_d,
-          x.data_ptr<input_t>(), dt.data_ptr<input_t>(), stride_xdt_n, stride_xdt_h,
-          A.data_ptr<input_t>(), stride_A_h,
-          B.data_ptr<input_t>(), C.data_ptr<input_t>(), stride_BC_n, stride_BC_g,
-          D.has_value() ? D.value().data_ptr<input_t>() : nullptr, stride_D_h,
-          z.has_value() ? z.value().data_ptr<input_t>() : nullptr,
-          dt_bias.has_value() ? dt_bias.value().data_ptr<input_t>() : nullptr, stride_dtbias_h,
+  VLLM_DISPATCH_FLOATING_TYPES(input_type, "ssu_input", [&] {
+    using input_t = scalar_t;
+    mamba_cpu::selective_state_update_kernel<input_t, input_t>(
+        state_in.data_ptr<input_t>(), stride_state_n, stride_state_h, stride_state_d,
+          x.data_ptr<input_t>(), dt_in.data_ptr<input_t>(), stride_xdt_n, stride_xdt_h,
+          A_in.data_ptr<input_t>(), stride_A_h,
+          B_in.data_ptr<input_t>(), C_in.data_ptr<input_t>(), stride_BC_n, stride_BC_g,
+          D_in.defined() ? D_in.data_ptr<input_t>() : nullptr, stride_D_h,
+          z_in.defined() ? z_in.data_ptr<input_t>() : nullptr,
+          dt_bias_in.defined() ? dt_bias_in.data_ptr<input_t>() : nullptr, stride_dtbias_h,
           out_f32.data_ptr<float>(), stride_out_n, stride_out_h,
           sbi_ptr, dsbi_ptr, static_cast<int32_t>(null_block_id),
           nat_ptr, csl_ptr, N, nheads, ngroups, dim, dstate, dt_softplus);
-    });
   });
 
+  // Copy the updated state back to the original state tensor
+  state.copy_(state_in);
   out.copy_(out_f32);
 }
