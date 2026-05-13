@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from enum import Enum
-from typing import Union
+from typing import TYPE_CHECKING, Union
 
 import torch
 
@@ -18,6 +18,7 @@ from vllm.model_executor.layers.fused_moe.all2all_utils import (
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     FusedMoEQuantDesc,
+    RoutingMethodType,
     mxfp4_mxfp8_moe_quant_config,
     mxfp4_w4a8_moe_quant_config,
     mxfp4_w4a16_moe_quant_config,
@@ -35,6 +36,10 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import all_close_1
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_triton_kernels
 from vllm.utils.math_utils import round_up
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+
 
 logger = init_logger(__name__)
 
@@ -64,6 +69,8 @@ class Mxfp4MoeBackend(Enum):
     MARLIN = "MARLIN"
     # ROCm AITER backends
     AITER_MXFP4_BF16 = "AITER_MXFP4_BF16"  # W4A16: CK kernel
+    # Keep the legacy name as an alias while the ROCm split backend rename settles.
+    AITER = "AITER_MXFP4_BF16"
     AITER_MXFP4_FP8 = "AITER_MXFP4_FP8"  # W4A8: triton kernel
     # Triton
     TRITON = "TRITON"
@@ -121,7 +128,7 @@ def backend_to_kernel_cls(
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
     ):
-        from vllm.model_executor.layers.fused_moe.flashinfer_cutlass_moe import (
+        from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutlass_moe import (  # noqa: E501
             FlashInferExperts,
         )
 
@@ -144,7 +151,7 @@ def backend_to_kernel_cls(
         return [UnfusedOAITritonExperts]
 
     elif backend == Mxfp4MoeBackend.HUMMING:
-        from vllm.model_executor.layers.fused_moe.fused_humming_moe import (
+        from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
             BatchedHummingGroupedExperts,
             HummingGroupedExperts,
             HummingIndexedExperts,
@@ -157,21 +164,21 @@ def backend_to_kernel_cls(
         ]
 
     elif backend == Mxfp4MoeBackend.MARLIN:
-        from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
+        from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
             MarlinExperts,
         )
 
         return [MarlinExperts]
 
     elif backend == Mxfp4MoeBackend.BATCHED_MARLIN:
-        from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
+        from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
             BatchedMarlinExperts,
         )
 
         return [BatchedMarlinExperts]
 
     elif backend == Mxfp4MoeBackend.AITER_MXFP4_BF16:
-        from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
+        from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
             AiterExperts,
         )
 
@@ -253,6 +260,8 @@ def _get_priority_backends() -> list[Mxfp4MoeBackend]:
     TRTLLM MXFP8; SM90 falls through to Triton_unfused or Marlin (the
     backend-level ``is_supported_config`` check filters by device capability).
     """
+    if current_platform.is_rocm():
+        return [Mxfp4MoeBackend.AITER_MXFP4_BF16]
     _AVAILABLE_BACKENDS = [
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
         Mxfp4MoeBackend.DEEPGEMM_MXFP4,
@@ -296,28 +305,6 @@ def select_mxfp4_moe_backend(
     """
     # If activation_key is explicitly provided (e.g., W4A8), use it
     requested_activation_key = activation_key
-    device_capability = current_platform.get_device_capability()
-    triton_kernels_supported = (
-        has_triton_kernels()
-        and device_capability is not None
-        and (9, 0) <= device_capability < (11, 0)
-    )
-
-    # LoRA: separate experts backend path
-    if config.is_lora_enabled:
-        if not current_platform.is_cuda():
-            # ROCm: Triton mxfp4 LoRA hits GPU memory faults due to
-            # triton_kernels.tensor.Tensor / HIP read-only page issues
-            # during weight swizzle and LoRA forward. Needs work from
-            # the triton_kernels/aiter side.
-            raise NotImplementedError("Mxfp4 LoRA is currently only supported on CUDA.")
-        if envs.VLLM_MXFP4_USE_MARLIN is False and triton_kernels_supported:
-            logger.info_once("Using Triton backend for mxfp4 lora")
-            return Mxfp4MoeBackend.TRITON_UNFUSED, backend_to_kernel_cls(
-                Mxfp4MoeBackend.TRITON_UNFUSED
-            )[0]
-        logger.info_once("Using Marlin backend for mxfp4 lora")
-        return Mxfp4MoeBackend.MARLIN, backend_to_kernel_cls(Mxfp4MoeBackend.MARLIN)[0]
 
     activation_format = (
         mk.FusedMoEActivationFormat.BatchedExperts
@@ -543,8 +530,22 @@ def select_deepseek_v4_mxfp4_moe_backend(
             activation_format,
         )
 
+    # DeepSeek-V4 on ROCm is more accurate with the unfused Triton MXFP4 path
+    # than the default AITER path. Prefer Triton-unfused for this routing mode,
+    # while keeping AITER as a fallback if Triton-unfused rejects the config.
+    if (
+        current_platform.is_rocm()
+        and config.routing_method == RoutingMethodType.DeepseekV4
+    ):
+        priority_backends = [
+            Mxfp4MoeBackend.TRITON_UNFUSED,
+            Mxfp4MoeBackend.AITER_MXFP4_BF16,
+        ]
+    else:
+        priority_backends = _get_priority_backends()
+
     # Iterate priority backends: TRTLLM MXFP8, then Triton.
-    for backend in _get_priority_backends():
+    for backend in priority_backends:
         activation_key = _backend_activation_key(backend)
         for k_cls in backend_to_kernel_cls(backend):
             supported, reason = k_cls.is_supported_config(
@@ -1252,6 +1253,64 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w2_bias,
         )
 
+    elif mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16:
+        from vllm._aiter_ops import rocm_aiter_ops
+
+        if w13_bias is not None:
+            w13_bias = w13_bias.data.to(torch.float32)
+        if w2_bias is not None:
+            w2_bias = w2_bias.data.to(torch.float32)
+
+        e, n, k = w13_weight.shape
+
+        w13_weight.view(torch.uint8).copy_(
+            w13_weight.data.view(torch.uint8)
+            .view(e, n // 2, 2, k)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+            .view(e, n, k)
+        )
+        w13_weight_scale.data = (
+            w13_weight_scale.data.view(e, n // 2, 2, -1)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+            .view(e, n, -1)
+        )
+
+        w13_weight.data = w13_weight.data.view(torch.float4_e2m1fn_x2)
+        w2_weight.data = w2_weight.data.view(torch.float4_e2m1fn_x2)
+
+        w13_weight.data = rocm_aiter_ops.shuffle_weight_a16w4(w13_weight, 16, True)
+        shuffled_w13_scale = rocm_aiter_ops.shuffle_scale_a16w4(
+            w13_weight_scale.view(-1, w13_weight_scale.shape[-1]),
+            num_experts,
+            True,
+        )
+
+        w2_weight.data = rocm_aiter_ops.shuffle_weight_a16w4(w2_weight, 16, False)
+        shuffled_w2_scale = rocm_aiter_ops.shuffle_scale_a16w4(
+            w2_weight_scale.view(-1, w2_weight_scale.shape[-1]),
+            num_experts,
+            False,
+        )
+
+        if w13_bias is not None:
+            w13_bias = (
+                w13_bias.data.view(-1, n // 2, 2)
+                .permute(0, 2, 1)
+                .contiguous()
+                .view(-1, n)
+            )
+
+        return (
+            w13_weight,
+            w2_weight,
+            shuffled_w13_scale,
+            shuffled_w2_scale,
+            w13_bias,
+            w2_bias,
+        )
+
     elif mxfp4_backend in TRITON_BACKENDS:
         from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
@@ -1307,7 +1366,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
     else:
         raise ValueError(
             f"Unsupported mxfp4_backend for Mxfp4MoEMethod: {mxfp4_backend}. "
-            f"Expected TRTLLM or Triton backend."
+            f"Expected TRTLLM, Triton, or AITER backend."
         )
 
 
@@ -1344,6 +1403,7 @@ def make_mxfp4_moe_quant_config(
             gemm1_clamp_limit=swiglu_limit,
         )
     elif mxfp4_backend == Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8:
+        # TRTLLM kernel expects non-swizzled mxfp8 activation scales.
         return mxfp4_mxfp8_moe_quant_config(
             w1_bias=w1_bias,
             w2_bias=w2_bias,
@@ -1353,8 +1413,10 @@ def make_mxfp4_moe_quant_config(
             gemm1_beta=gemm1_beta,
             gemm1_clamp_limit=swiglu_limit,
             mx_alignment=256,
+            is_scale_swizzled=False,
         )
     elif mxfp4_backend == Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8:
+        # CUTLASS kernel expects swizzled mxfp8 activation scales.
         return mxfp4_mxfp8_moe_quant_config(
             w1_bias=w1_bias,
             w2_bias=w2_bias,
@@ -1363,6 +1425,7 @@ def make_mxfp4_moe_quant_config(
             gemm1_alpha=gemm1_alpha,
             gemm1_beta=gemm1_beta,
             gemm1_clamp_limit=swiglu_limit,
+            is_scale_swizzled=True,
         )
     elif mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_FP8:
         # W4A8: MXFP4 weights + static FP8 activations
@@ -1420,8 +1483,7 @@ def make_mxfp4_moe_kernel(
     experts_cls: type[mk.FusedMoEExperts],
     mxfp4_backend: Mxfp4MoeBackend,
     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
-    shared_experts: torch.nn.Module | None = None,
-    layer: torch.nn.Module | None = None,
+    layer: "RoutedExperts | None" = None,
 ) -> mk.FusedMoEKernel:
     """Create a FusedMoEKernel for the given MXFP4 backend."""
     is_monolithic = issubclass(experts_cls, mk.FusedMoEExpertsMonolithic)
@@ -1463,11 +1525,6 @@ def make_mxfp4_moe_kernel(
     kernel = mk.FusedMoEKernel(
         prepare_finalize,
         experts,
-        shared_experts=(
-            shared_experts
-            if moe_config.moe_parallel_config.use_batched_activation_format
-            else None
-        ),
         inplace=(
             not moe_config.disable_inplace and mxfp4_backend not in TRTLLM_BACKENDS
         ),

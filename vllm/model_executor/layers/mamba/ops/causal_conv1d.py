@@ -41,7 +41,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     num_cache_lines: tl.constexpr,  # added to support vLLM larger cache lines
     # Strides
     stride_x_dim: tl.constexpr,  # stride to get to next feature-value,
-    stride_x_token: tl.constexpr,  # stride to get to next token (same feature-index, same sequence-index)
+    stride_x_token: tl.int64,  # stride to get to next token (same feature-index, same sequence-index)
     stride_w_dim: tl.constexpr,  # stride to get to next dim-axis value
     stride_w_width: tl.constexpr,  # stride to get to next width-axis value
     stride_istate_seq: tl.constexpr,
@@ -49,7 +49,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     stride_istate_token: tl.constexpr,
     stride_cache_indices: tl.constexpr,
     stride_o_dim: tl.constexpr,
-    stride_o_token: tl.constexpr,
+    stride_o_token: tl.int64,
     stride_block_m: tl.constexpr,  # Stride block to align divided by BLOCK_M
     # others
     pad_slot_id: tl.constexpr,
@@ -773,7 +773,7 @@ def _causal_conv1d_update_kernel(
     # Strides
     stride_x_seq: tl.constexpr,
     stride_x_dim: tl.constexpr,
-    stride_x_token: tl.constexpr,
+    stride_x_token: tl.int64,
     stride_w_dim: tl.constexpr,
     stride_w_width: tl.constexpr,
     stride_conv_state_seq: tl.constexpr,
@@ -782,7 +782,7 @@ def _causal_conv1d_update_kernel(
     stride_state_indices: tl.constexpr,
     stride_o_seq: tl.constexpr,
     stride_o_dim: tl.constexpr,
-    stride_o_token: tl.constexpr,
+    stride_o_token: tl.int64,
     # others
     null_block_id: tl.constexpr,
     # Meta-parameters
