@@ -50,7 +50,16 @@ FORCE_INLINE void load_row8_B_as_f32<c10::BFloat16>(const c10::BFloat16* p,
   b1 = (__vector float)vec_mergel(zeros, raw);
 }
 
-// Note: c10::Half (FP16) is not supported on PowerPC architecture
+// [3] Half (FP16) Specialization
+template <>
+FORCE_INLINE void load_row8_B_as_f32<c10::Half>(const c10::Half* p,
+                                                __vector float& b0,
+                                                __vector float& b1) {
+  vec_op::FP16Vec8 fp16_vec(p);
+  vec_op::FP32Vec8 fp32_vec(fp16_vec);
+  b0 = fp32_vec.reg.val[0];
+  b1 = fp32_vec.reg.val[1];
+}
 
 // Prefetch distance for B rows in the GEMM hot loops (VSX and MMA).
 // Tunable at compile time: -DVSX_ATTN_PREFETCH_DIST=N (0 disables prefetch).
@@ -713,3 +722,4 @@ class AttentionImpl<ISA::VSX, scalar_t, head_dim> {
 #undef MAX_Q_HEAD_NUM_PER_ITER
 
 #endif  // CPU_ATTN_VSX_HPP
+
