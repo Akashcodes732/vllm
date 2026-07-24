@@ -361,14 +361,13 @@ class CPUAttentionBackendImpl(AttentionImpl):
         kv_cache = kv_cache.view((num_blocks, num_kv_heads, block_size * 2, -1))
         key_cache, value_cache = kv_cache.chunk(2, dim=2)
 
-        # key and value may be None in the case of cross attention. They are
-        # calculated once based on the output from the encoder and then cached
-        # in KV cache.
-        if (
-            self.kv_sharing_target_layer_name is None
-            and key is not None
-            and value is not None
-        ):
+        # Write K/V into the cache for every decoder layer, including MTP
+        # draft layers that share the target model's KV cache.  On CPU,
+        # cache writes are always explicit; the kv_sharing_target_layer_name
+        # flag only means we reuse the *same* physical cache tensor — the
+        # draft model still needs to fill its own new (speculative) slots.
+        # key/value may be None for cross-attention; skip the write then.
+        if key is not None and value is not None:
             ops.cpu_attn_reshape_and_cache(
                 key,
                 value,
