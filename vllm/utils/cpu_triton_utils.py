@@ -413,13 +413,21 @@ def _expand_kernel_impl(
     replace_to,
     MAX_NUM_TOKENS=None,
 ):
+    # C++ kernel writes int64_t*. If the caller's output tensor is not int64
+    # (e.g. int32 from x.new_empty()), _ensure_int64 would create a temporary
+    # and discard the write. Save dtype, use a guaranteed-int64 alias, then
+    # copy back — same pattern as the other wrappers in this file.
+    orig_dtype = output.dtype
+    output_i64 = _ensure_int64(output)
     torch.ops._C.expand_kernel_impl(
-        _ensure_int64(output),
+        output_i64,
         _ensure_int64(input_val),
         _ensure_int64(cu_num_tokens),
         replace_from,
         replace_to,
     )
+    if orig_dtype != torch.int64:
+        output.copy_(output_i64.to(orig_dtype))
 
 
 def _sample_recovered_tokens_kernel_impl(
