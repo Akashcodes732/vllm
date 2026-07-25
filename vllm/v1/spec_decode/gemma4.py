@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Gemma4 MTP (Multi-Token Prediction) proposer for speculative decoding.
 
-The Gemma4 assistant model runs all decoder layers per draft step
-(producing one token), and all its attention layers share KV cache
-with the target model via cross-model KV sharing.
+The Gemma4 assistant model has N decoder layers that run in a single forward
+pass, with layer i producing the draft hidden state for speculative token i.
+All assistant attention layers share KV cache with the target model via
+cross-model KV sharing (Q-only attention reads from the target's cached K/V).
 """
 
 from collections import defaultdict
@@ -14,6 +15,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config, replace
+from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -22,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -62,10 +65,109 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
         self._per_group_block_tables[gid] = block_table
 
     def model_returns_tuple(self) -> bool:
-        # forward() returns (draft_hidden_states, backbone_hidden_states).
-        # The proposer uses draft_hidden_states for compute_logits and
-        # backbone_hidden_states for the hidden-state feedback buffer.
+        # forward() returns (all_draft_hidden_states, backbone_hidden_states).
+        # all_draft_hidden_states is [num_mtp_layers * T, draft_hidden_size],
+        # containing per-layer outputs for all T tokens in the batch.
         return True
+
+    def propose(
+        self,
+        num_speculative_tokens: int,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        token_indices_to_sample: torch.Tensor | None,
+        common_attn_metadata: CommonAttentionMetadata,
+        sampling_metadata: SamplingMetadata,
+        mm_embed_inputs=None,
+        num_rejected_tokens_gpu: torch.Tensor | None = None,
+        slot_mappings=None,
+    ) -> torch.Tensor:
+        """Single-pass MTP proposer for Gemma4.
+
+        The Gemma4 assistant runs all num_mtp_layers decoder layers in one
+        forward call.  Each layer i produces the draft hidden state for
+        speculative token i.  We sample all num_speculative_tokens tokens in
+        one shot from the stacked per-layer outputs.
+        """
+        self.num_speculative_tokens = num_speculative_tokens
+        self._last_draft_probs = None
+        batch_size = common_attn_metadata.batch_size()
+
+        num_tokens, token_indices_to_sample, common_attn_metadata = (
+            self.set_inputs_first_pass(
+                target_token_ids=target_token_ids,
+                next_token_ids=next_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                token_indices_to_sample=token_indices_to_sample,
+                cad=common_attn_metadata,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+            )
+        )
+
+        _, per_layer_attn_metadata = self.build_per_group_and_layer_attn_metadata(
+            common_attn_metadata
+        )
+
+        _, num_input_tokens, num_tokens_across_dp = (
+            self._determine_batch_execution_and_padding(num_tokens)
+        )
+
+        model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
+            num_tokens, num_input_tokens, mm_embed_inputs
+        )
+
+        with set_forward_context(
+            per_layer_attn_metadata,
+            self.vllm_config,
+            num_tokens=num_input_tokens,
+            num_tokens_across_dp=num_tokens_across_dp,
+            slot_mapping=self._get_slot_mapping(
+                slot_mapping_size, common_attn_metadata.slot_mapping
+            ),
+        ):
+            # all_draft_hidden: [num_mtp_layers * num_tokens, draft_hidden_size]
+            # backbone_hidden:  [num_tokens, backbone_hidden_size]
+            all_draft_hidden, backbone_hidden = self.model(**model_kwargs)
+
+        if num_speculative_tokens == 0:
+            return torch.empty(
+                batch_size, 0,
+                device=all_draft_hidden.device,
+                dtype=torch.int64,
+            )
+
+        # all_draft_hidden rows are in layer-major order:
+        # [layer0_tok0, layer0_tok1, ..., layer1_tok0, layer1_tok1, ...]
+        # We want req-major order for _sample_draft_tokens:
+        # [req0_layer0, req0_layer1, ..., req1_layer0, req1_layer1, ...]
+        # token_indices_to_sample selects the last-token row per request
+        # from the first num_tokens rows (layer 0's block).
+        num_mtp_layers = all_draft_hidden.shape[0] // num_tokens
+        # Per-request, per-layer hidden states in req-major order.
+        # Shape: [batch_size * num_mtp_layers, draft_hidden_size]
+        per_req_per_layer = torch.stack(
+            [
+                all_draft_hidden[
+                    l * num_tokens + token_indices_to_sample
+                ]
+                for l in range(num_mtp_layers)
+            ],
+            dim=1,
+        ).view(batch_size * num_mtp_layers, -1)
+
+        # Sample one token per (request, layer) pair.
+        draft_token_ids, draft_probs = self._sample_draft_tokens(
+            per_req_per_layer, sampling_metadata
+        )
+        if draft_probs is not None:
+            self._last_draft_probs = draft_probs.view(
+                batch_size, num_mtp_layers, -1
+            ).contiguous()
+
+        return draft_token_ids.view(batch_size, num_mtp_layers)
 
     def build_per_group_and_layer_attn_metadata(
         self,

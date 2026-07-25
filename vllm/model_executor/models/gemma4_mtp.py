@@ -427,11 +427,13 @@ class Gemma4MultiTokenPredictor(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns (draft_hidden_states, backbone_hidden_states).
+        """Returns (all_draft_hidden_states, backbone_hidden_states).
 
-        draft_hidden_states: draft-dim, used by compute_logits via lm_head.
-        backbone_hidden_states: backbone-dim, stored in the proposer's
-            hidden-state buffer and fed back as input to the next step.
+        all_draft_hidden_states: shape [T * num_mtp_layers, draft_hidden_size].
+            Row i*T .. (i+1)*T-1 is the draft-dim hidden state after layer i,
+            used by compute_logits to produce one draft token per layer.
+        backbone_hidden_states: backbone-dim output of the final layer,
+            stored in the proposer's hidden-state buffer for the next step.
         """
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
@@ -440,17 +442,20 @@ class Gemma4MultiTokenPredictor(nn.Module):
         hidden_states, _ = self.pre_projection(combined)
 
         residual = None
+        per_layer_draft_hidden: list[torch.Tensor] = []
         for layer in self.layers:
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
             )
+            per_layer_draft_hidden.append(self.norm(hidden_states))
 
-        draft_hidden_states = self.norm(hidden_states)
+        # Stack all per-layer draft outputs: [num_layers * T, draft_hidden_size]
+        all_draft_hidden_states = torch.cat(per_layer_draft_hidden, dim=0)
 
-        backbone_hidden_states, _ = self.post_projection(draft_hidden_states)
-        return draft_hidden_states, backbone_hidden_states
+        backbone_hidden_states, _ = self.post_projection(per_layer_draft_hidden[-1])
+        return all_draft_hidden_states, backbone_hidden_states
 
 
 @support_torch_compile
