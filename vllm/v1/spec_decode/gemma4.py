@@ -107,6 +107,14 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
             )
         )
 
+        # Remove rejected-token padding from seq_lens so the draft attention
+        # reads the correct number of KV entries (same adjustment the base
+        # class propose() loop applies before building draft metadata).
+        if num_rejected_tokens_gpu is not None:
+            common_attn_metadata.seq_lens -= num_rejected_tokens_gpu
+            common_attn_metadata._seq_lens_cpu = None
+            common_attn_metadata._num_computed_tokens_cpu = None
+
         _, per_layer_attn_metadata = self.build_per_group_and_layer_attn_metadata(
             common_attn_metadata
         )
