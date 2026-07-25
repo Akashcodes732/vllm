@@ -361,13 +361,21 @@ class CPUAttentionBackendImpl(AttentionImpl):
         kv_cache = kv_cache.view((num_blocks, num_kv_heads, block_size * 2, -1))
         key_cache, value_cache = kv_cache.chunk(2, dim=2)
 
-        # Write K/V into the cache for every decoder layer, including MTP
-        # draft layers that share the target model's KV cache.  On CPU,
-        # cache writes are always explicit; the kv_sharing_target_layer_name
-        # flag only means we reuse the *same* physical cache tensor — the
-        # draft model still needs to fill its own new (speculative) slots.
-        # key/value may be None for cross-attention; skip the write then.
-        if key is not None and value is not None:
+        # Write K/V into the cache.
+        # KV-sharing draft layers (e.g. Gemma4 MTP) pass dummy K/V tensors to
+        # satisfy the attention API; the real K/V were written by the target
+        # model.  Skip the write for those layers to avoid corrupting the shared
+        # cache.  Cross-attention layers also skip (key/value may be None once
+        # the encoder output is cached).
+        # NOTE: check layer.kv_sharing_target_layer_name (the Attention wrapper),
+        # not self.kv_sharing_target_layer_name (the impl), because KV-sharing
+        # is wired after model construction via _setup_gemma4_kv_sharing() and
+        # the impl's copy is never updated.
+        if (
+            getattr(layer, "kv_sharing_target_layer_name", None) is None
+            and key is not None
+            and value is not None
+        ):
             ops.cpu_attn_reshape_and_cache(
                 key,
                 value,
