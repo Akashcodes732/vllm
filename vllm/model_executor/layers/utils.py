@@ -352,6 +352,31 @@ def dispatch_cpu_unquantized_gemm(
         )
         return
 
+    # Power10/VSX: pre-pack weight once at load time using MMA-friendly layout,
+    # then use xvbf16ger2pp for all inference GEMMs.
+    # Only activates when:
+    #   - Running on PPC (vsx_bf16_mm op present)
+    #   - Weight is BF16
+    #   - Shape satisfies MMA alignment: N%16==0, K%2==0
+    if (
+        ops._has_vsx_bf16_mm
+        and current_platform.get_cpu_architecture() == CpuArchEnum.POWERPC
+        and dtype == torch.bfloat16
+        and N % 16 == 0
+        and K % 2 == 0
+    ):
+        packed_weight = ops.vsx_pack_weight(layer.weight.detach())
+        _bias = layer.bias.detach() if getattr(layer, "bias", None) is not None else None
+        layer.cpu_linear = lambda x, weight, bias: ops.vsx_bf16_mm(
+            x, packed_weight, _bias if bias is not None else None
+        )
+        if remove_weight:
+            layer.weight = torch.nn.Parameter(torch.empty(0), requires_grad=False)
+        logger.debug_once(
+            "CPU unquantized GEMM dispatch: using Power10 VSX MMA pre-packed linear"
+        )
+        return
+
     if (
         ops._supports_onednn
         and current_platform.get_cpu_architecture() != CpuArchEnum.POWERPC

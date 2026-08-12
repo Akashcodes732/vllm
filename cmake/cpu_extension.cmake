@@ -491,9 +491,10 @@ if (ASIMD_FOUND AND NOT APPLE_SILICON_FOUND)
     endif()
 endif()
 
-if (POWER9_FOUND OR POWER10_FOUND OR POWER11_FOUND)	
+if (POWER9_FOUND OR POWER10_FOUND OR POWER11_FOUND)
     set(VLLM_EXT_SRC
         "csrc/cpu/shm.cpp"
+        "csrc/cpu/cpu_linear_vsx.cpp"
         ${VLLM_EXT_SRC})
 endif()
 

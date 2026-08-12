@@ -3684,6 +3684,38 @@ class CPUDNNLGEMMHandler:
 
 _supports_onednn = bool(hasattr(torch.ops._C, "create_onednn_mm_handler"))
 
+# Power10/VSX dense BF16 linear with pre-packed weights.
+# Ops are registered only when compiled on PPC (__powerpc64__).
+_has_vsx_bf16_mm = bool(hasattr(torch.ops._C, "vsx_bf16_mm"))
+
+
+def vsx_pack_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Pack a BF16 [N, K] weight tensor into MMA-friendly VSX layout.
+
+    Requirements: N % 16 == 0, K % 2 == 0, dtype == bfloat16.
+    Returns a packed tensor of the same shape for use with vsx_bf16_mm.
+    Only available on Power10+ with __powerpc64__ defined.
+    """
+    return torch.ops._C.vsx_pack_weight(weight)
+
+
+def vsx_bf16_mm(
+    A: torch.Tensor,
+    packed_B: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Dense BF16 GEMM using Power10 MMA instructions.
+
+    A:        BF16 tensor [..., K]
+    packed_B: BF16 tensor [N, K] from vsx_pack_weight()
+    bias:     optional BF16 tensor [N]
+
+    Returns BF16 tensor [..., N]. Accumulates in FP32 internally.
+    Only available on Power10+ with __powerpc64__ defined.
+    """
+    return torch.ops._C.vsx_bf16_mm(A, packed_B, bias)
+
+
 
 def is_onednn_acl_supported():
     return torch.ops._C.is_onednn_acl_supported()
