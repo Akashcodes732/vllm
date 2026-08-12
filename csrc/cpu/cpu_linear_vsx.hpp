@@ -18,7 +18,7 @@
 #pragma once
 #ifdef __powerpc64__
 
-#include <torch/extension.h>
+#include <torch/all.h>
 #include <algorithm>
 #include <optional>
 
