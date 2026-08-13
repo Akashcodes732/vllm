@@ -19,12 +19,9 @@
 #ifdef __powerpc64__
 
 #include <torch/all.h>
+#include <ATen/Parallel.h>
 #include <algorithm>
 #include <optional>
-
-#ifdef _OPENMP
-#include <omp.h>
-#endif
 
 #include "cpu/micro_gemm/cpu_micro_gemm_impl.hpp"
 #include "cpu/micro_gemm/cpu_micro_gemm_vsx.hpp"
@@ -71,13 +68,6 @@ inline at::Tensor pack_weight(at::Tensor& weight) {
 // packed_B: BF16 tensor [N, K] in MMA-packed layout (output of pack_weight)
 // bias:     optional BF16 tensor [N]
 //
-// Parallelized across N-tiles using OpenMP. Each thread accumulates into a
-// stack-allocated per-tile FP32 buffer (MaxM*NTile*4 = 512 bytes) and writes
-// BF16 output directly — no shared mutable state, no synchronization needed.
-//
-// For M <= 4 (decode), TileGemmVSX dispatches to gemm_micro_vsx_fallback
-// (vec_madd path). For M > 4, xvbf16ger2pp MMA is used.
-//
 // Returns:
 //   BF16 tensor [..., N]
 inline at::Tensor bf16_mm(const at::Tensor& A, const at::Tensor& packed_B,
@@ -120,54 +110,72 @@ inline at::Tensor bf16_mm(const at::Tensor& A, const at::Tensor& packed_B,
 
   constexpr int32_t MaxM = GemmT::MaxMSize;  // 8
   constexpr int32_t NTile = GemmT::NSize;    // 16
+  
+  // Power10 L1d is 32 KB per core. 
+  // A chunk of A: 8 * 256 * 2 bytes = 4 KB.
+  // A chunk of packed B: 16 * 256 * 2 bytes = 8 KB.
+  // Total working set = 12 KB (fits comfortably in 32 KB L1d).
+  constexpr int64_t K_BLOCK = 256;
 
   const int32_t num_n_tiles = static_cast<int32_t>(N / NTile);
+  const int32_t num_m_tiles = static_cast<int32_t>((M + MaxM - 1) / MaxM);
 
-  // Parallel over N-tiles: each thread handles a disjoint column range.
-  // No shared writes — output tiles and stack buffers are per-thread.
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-  for (int32_t n_t = 0; n_t < num_n_tiles; ++n_t) {
-    // Per-thread, per-tile FP32 accumulation buffer: 8*16*4 = 512 bytes.
-    // Stack-allocated: zero heap overhead, cache-hot per thread.
-    alignas(64) float c_tile_buf[MaxM * NTile];
+  // PyTorch's native thread pool, parallelizing over 2D tile blocks.
+  // This avoids OpenMP oversubscription when vLLM is already using threads.
+  at::parallel_for_2d(
+      0, num_m_tiles, 0, num_n_tiles, 1,
+      [&](int64_t m_start_t, int64_t m_end_t, int64_t n_start_t, int64_t n_end_t) {
+        
+        // Per-thread, per-tile FP32 accumulation buffer: 8*16*4 = 512 bytes.
+        alignas(64) float c_tile_buf[MaxM * NTile];
+        GemmT gemm;
 
-    GemmT gemm;
-    const at::BFloat16* b_tile =
-        b_ptr + static_cast<int64_t>(n_t) * NTile * K;
-    at::BFloat16* out_col = out_ptr + n_t * NTile;
-    const at::BFloat16* bias_col =
-        bias_ptr ? bias_ptr + n_t * NTile : nullptr;
+        for (int64_t m_t = m_start_t; m_t < m_end_t; ++m_t) {
+          int64_t m_off = m_t * MaxM;
+          int32_t m_actual = static_cast<int32_t>(
+              std::min(static_cast<int64_t>(MaxM), M - m_off));
+              
+          for (int64_t n_t = n_start_t; n_t < n_end_t; ++n_t) {
+            const at::BFloat16* b_tile =
+                b_ptr + static_cast<int64_t>(n_t) * NTile * K;
+            at::BFloat16* out_col = out_ptr + n_t * NTile;
+            const at::BFloat16* bias_col =
+                bias_ptr ? bias_ptr + n_t * NTile : nullptr;
 
-    for (int64_t m_off = 0; m_off < M; m_off += MaxM) {
-      const int32_t m_actual = static_cast<int32_t>(
-          std::min(static_cast<int64_t>(MaxM), M - m_off));
+            // K-Blocking loop: Keep working set inside L1 cache
+            for (int64_t k_off = 0; k_off < K; k_off += K_BLOCK) {
+              int32_t k_actual = static_cast<int32_t>(
+                  std::min(K_BLOCK, K - k_off));
+              
+              // accumulate into c_tile_buf after the first K-block
+              bool accum = (k_off != 0);
 
-      gemm.gemm(const_cast<at::BFloat16*>(a_ptr + m_off * K),
-                const_cast<at::BFloat16*>(b_tile),
-                c_tile_buf,
-                m_actual,
-                static_cast<int32_t>(K),
-                static_cast<int32_t>(K),    // lda
-                static_cast<int32_t>(K),    // b_n_group_stride
-                NTile,                      // ldc = tile width, not full N
-                /*accum_c=*/false);
+              gemm.gemm(const_cast<at::BFloat16*>(a_ptr + m_off * K + k_off),
+                        const_cast<at::BFloat16*>(b_tile + k_off * NTile),
+                        c_tile_buf,
+                        m_actual,
+                        k_actual,
+                        static_cast<int32_t>(K),    // lda
+                        static_cast<int32_t>(K),    // b_n_group_stride
+                        NTile,                      // ldc = tile width
+                        accum);
+            }
 
-      // Epilogue: FP32 tile -> BF16, writing into the correct output column.
-      at::BFloat16* out_tile_row = out_col + m_off * N;
-      if (bias_col) {
-        cpu_micro_gemm::bias_epilogue<NTile, at::BFloat16>(
-            c_tile_buf, out_tile_row,
-            const_cast<at::BFloat16*>(bias_col),
-            m_actual, NTile, static_cast<int32_t>(N));
-      } else {
-        cpu_micro_gemm::default_epilogue<NTile, at::BFloat16>(
-            c_tile_buf, out_tile_row, m_actual, NTile,
-            static_cast<int32_t>(N));
-      }
-    }
-  }
+            // Epilogue: FP32 tile -> BF16, writing into the correct output column.
+            at::BFloat16* out_tile_row = out_col + m_off * N;
+            if (bias_col) {
+              cpu_micro_gemm::bias_epilogue<NTile, at::BFloat16>(
+                  c_tile_buf, out_tile_row,
+                  const_cast<at::BFloat16*>(bias_col),
+                  m_actual, NTile, static_cast<int32_t>(N));
+            } else {
+              cpu_micro_gemm::default_epilogue<NTile, at::BFloat16>(
+                  c_tile_buf, out_tile_row, m_actual, NTile,
+                  static_cast<int32_t>(N));
+            }
+          }
+        }
+      });
 
   return out_bf16;
 }
