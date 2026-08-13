@@ -3687,6 +3687,23 @@ _supports_onednn = bool(hasattr(torch.ops._C, "create_onednn_mm_handler"))
 # Power10/VSX dense BF16 linear with pre-packed weights.
 _has_vsx_bf16_mm = "_C::vsx_bf16_mm" in torch._C._dispatch_get_all_op_names()
 
+if _has_vsx_bf16_mm:
+
+    @register_fake("_C::vsx_pack_weight")
+    def vsx_pack_weight_fake(weight: torch.Tensor) -> torch.Tensor:
+        # Packed weight has the same shape [N, K] as the input.
+        return torch.empty_like(weight)
+
+    @register_fake("_C::vsx_bf16_mm")
+    def vsx_bf16_mm_fake(
+        A: torch.Tensor,
+        packed_B: torch.Tensor,
+        bias: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        # A: [..., K], packed_B: [N, K], output: [..., N]
+        N = packed_B.shape[0]
+        return A.new_empty((*A.shape[:-1], N))
+
 
 def vsx_pack_weight(weight: torch.Tensor) -> torch.Tensor:
     """Pack a BF16 [N, K] weight tensor into MMA-friendly VSX layout.
@@ -3713,9 +3730,6 @@ def vsx_bf16_mm(
     Only available on Power10+ with __powerpc64__ defined.
     """
     return torch.ops._C.vsx_bf16_mm(A, packed_B, bias)
-
-
-
 def is_onednn_acl_supported():
     return torch.ops._C.is_onednn_acl_supported()
 
