@@ -358,11 +358,6 @@ def dispatch_cpu_unquantized_gemm(
     #   - Running on PPC (vsx_bf16_mm op present)
     #   - Weight is BF16
     #   - Shape satisfies MMA alignment: N%16==0, K%2==0
-    #
-    # Dynamic M-threshold: for M <= 4 (decode, single token) the packed B
-    # layout hurts the hardware prefetcher vs row-major, so fall back to
-    # F.linear. For M > 4 the MMA kernel fires and amortizes the packing cost.
-    _VSX_M_THRESHOLD = 4
     if (
         ops._has_vsx_bf16_mm
         and current_platform.get_cpu_architecture() == CpuArchEnum.POWERPC
@@ -372,21 +367,16 @@ def dispatch_cpu_unquantized_gemm(
     ):
         packed_weight = ops.vsx_pack_weight(layer.weight.detach())
         _bias = layer.bias.detach() if getattr(layer, "bias", None) is not None else None
-        _orig_weight = layer.weight.detach()
-
-        def _vsx_cpu_linear(x, weight, bias, _pw=packed_weight,
-                            _ow=_orig_weight, _b=_bias,
-                            _thr=_VSX_M_THRESHOLD):
-            m = x.numel() // x.size(-1)
-            if m > _thr:
-                return ops.vsx_bf16_mm(x, _pw, _b if bias is not None else None)
-            return torch.nn.functional.linear(x, _ow, bias)
-
-        layer.cpu_linear = _vsx_cpu_linear
-        # Do not remove weight: F.linear fallback needs it for M <= threshold.
+        
+        layer.cpu_linear = lambda x, weight, bias: ops.vsx_bf16_mm(
+            x, packed_weight, _bias if bias is not None else None
+        )
+        
+        if remove_weight:
+            layer.weight = torch.nn.Parameter(torch.empty(0), requires_grad=False)
+            
         logger.debug_once(
-            "CPU unquantized GEMM dispatch: using Power10 VSX MMA pre-packed "
-            "linear (M-threshold=%d)", _VSX_M_THRESHOLD
+            "CPU unquantized GEMM dispatch: using Power10 VSX MMA pre-packed linear"
         )
         return
 

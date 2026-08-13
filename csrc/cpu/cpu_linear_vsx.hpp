@@ -120,59 +120,61 @@ inline at::Tensor bf16_mm(const at::Tensor& A, const at::Tensor& packed_B,
   const int32_t num_n_tiles = static_cast<int32_t>(N / NTile);
   const int32_t num_m_tiles = static_cast<int32_t>((M + MaxM - 1) / MaxM);
 
-  // PyTorch's native thread pool, parallelizing over 2D tile blocks.
+  // PyTorch's native thread pool, parallelizing over 1D flattened tile blocks.
   // This avoids OpenMP oversubscription when vLLM is already using threads.
-  at::parallel_for_2d(
-      0, num_m_tiles, 0, num_n_tiles, 1,
-      [&](int64_t m_start_t, int64_t m_end_t, int64_t n_start_t, int64_t n_end_t) {
+  int64_t total_tiles = static_cast<int64_t>(num_m_tiles) * num_n_tiles;
+  at::parallel_for(
+      0, total_tiles, 1,
+      [&](int64_t begin, int64_t end) {
         
         // Per-thread, per-tile FP32 accumulation buffer: 8*16*4 = 512 bytes.
         alignas(64) float c_tile_buf[MaxM * NTile];
         GemmT gemm;
 
-        for (int64_t m_t = m_start_t; m_t < m_end_t; ++m_t) {
+        for (int64_t idx = begin; idx < end; ++idx) {
+          int64_t m_t = idx / num_n_tiles;
+          int64_t n_t = idx % num_n_tiles;
+
           int64_t m_off = m_t * MaxM;
           int32_t m_actual = static_cast<int32_t>(
               std::min(static_cast<int64_t>(MaxM), M - m_off));
               
-          for (int64_t n_t = n_start_t; n_t < n_end_t; ++n_t) {
-            const at::BFloat16* b_tile =
-                b_ptr + static_cast<int64_t>(n_t) * NTile * K;
-            at::BFloat16* out_col = out_ptr + n_t * NTile;
-            const at::BFloat16* bias_col =
-                bias_ptr ? bias_ptr + n_t * NTile : nullptr;
+          const at::BFloat16* b_tile =
+              b_ptr + static_cast<int64_t>(n_t) * NTile * K;
+          at::BFloat16* out_col = out_ptr + n_t * NTile;
+          const at::BFloat16* bias_col =
+              bias_ptr ? bias_ptr + n_t * NTile : nullptr;
 
-            // K-Blocking loop: Keep working set inside L1 cache
-            for (int64_t k_off = 0; k_off < K; k_off += K_BLOCK) {
-              int32_t k_actual = static_cast<int32_t>(
-                  std::min(K_BLOCK, K - k_off));
-              
-              // accumulate into c_tile_buf after the first K-block
-              bool accum = (k_off != 0);
+          // K-Blocking loop: Keep working set inside L1 cache
+          for (int64_t k_off = 0; k_off < K; k_off += K_BLOCK) {
+            int32_t k_actual = static_cast<int32_t>(
+                std::min(K_BLOCK, K - k_off));
+            
+            // accumulate into c_tile_buf after the first K-block
+            bool accum = (k_off != 0);
 
-              gemm.gemm(const_cast<at::BFloat16*>(a_ptr + m_off * K + k_off),
-                        const_cast<at::BFloat16*>(b_tile + k_off * NTile),
-                        c_tile_buf,
-                        m_actual,
-                        k_actual,
-                        static_cast<int32_t>(K),    // lda
-                        static_cast<int32_t>(K),    // b_n_group_stride
-                        NTile,                      // ldc = tile width
-                        accum);
-            }
+            gemm.gemm(const_cast<at::BFloat16*>(a_ptr + m_off * K + k_off),
+                      const_cast<at::BFloat16*>(b_tile + k_off * NTile),
+                      c_tile_buf,
+                      m_actual,
+                      k_actual,
+                      static_cast<int32_t>(K),    // lda
+                      static_cast<int32_t>(K),    // b_n_group_stride
+                      NTile,                      // ldc = tile width
+                      accum);
+          }
 
-            // Epilogue: FP32 tile -> BF16, writing into the correct output column.
-            at::BFloat16* out_tile_row = out_col + m_off * N;
-            if (bias_col) {
-              cpu_micro_gemm::bias_epilogue<NTile, at::BFloat16>(
-                  c_tile_buf, out_tile_row,
-                  const_cast<at::BFloat16*>(bias_col),
-                  m_actual, NTile, static_cast<int32_t>(N));
-            } else {
-              cpu_micro_gemm::default_epilogue<NTile, at::BFloat16>(
-                  c_tile_buf, out_tile_row, m_actual, NTile,
-                  static_cast<int32_t>(N));
-            }
+          // Epilogue: FP32 tile -> BF16, writing into the correct output column.
+          at::BFloat16* out_tile_row = out_col + m_off * N;
+          if (bias_col) {
+            cpu_micro_gemm::bias_epilogue<NTile, at::BFloat16>(
+                c_tile_buf, out_tile_row,
+                const_cast<at::BFloat16*>(bias_col),
+                m_actual, NTile, static_cast<int32_t>(N));
+          } else {
+            cpu_micro_gemm::default_epilogue<NTile, at::BFloat16>(
+                c_tile_buf, out_tile_row, m_actual, NTile,
+                static_cast<int32_t>(N));
           }
         }
       });
