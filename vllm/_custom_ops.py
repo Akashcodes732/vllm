@@ -3685,8 +3685,7 @@ class CPUDNNLGEMMHandler:
 _supports_onednn = bool(hasattr(torch.ops._C, "create_onednn_mm_handler"))
 
 # Power10/VSX dense BF16 linear with pre-packed weights.
-# Ops are registered only when compiled on PPC (__powerpc64__).
-_has_vsx_bf16_mm = bool(hasattr(torch.ops._C, "vsx_bf16_mm"))
+_has_vsx_bf16_mm = "_C::vsx_bf16_mm" in torch._C._dispatch_get_all_op_names()
 
 
 def vsx_pack_weight(weight: torch.Tensor) -> torch.Tensor:
