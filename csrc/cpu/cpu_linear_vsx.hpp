@@ -16,7 +16,7 @@
 //   K % 2  == 0  (two BF16 elements per MMA pair)
 
 #pragma once
-#ifdef __powerpc64__
+#if defined(__powerpc__) || defined(__powerpc64__) || defined(__PPC64__)
 
 #include <torch/all.h>
 #include <ATen/Parallel.h>
@@ -183,5 +183,4 @@ inline at::Tensor bf16_mm(const at::Tensor& A, const at::Tensor& packed_B,
 }
 
 }  // namespace cpu_linear_vsx
-
-#endif  // __powerpc64__
+#endif  // defined(__powerpc__) || defined(__powerpc64__) || defined(__PPC64__)

@@ -5,7 +5,7 @@
 // Provides the C-linkage function bodies that torch_bindings.cpp declares
 // as extern and registers as Torch custom ops.
 
-#ifdef __powerpc64__
+#if defined(__powerpc__) || defined(__powerpc64__) || defined(__PPC64__)
 
 #include "cpu/cpu_linear_vsx.hpp"
 
@@ -18,4 +18,4 @@ at::Tensor vsx_bf16_mm(const at::Tensor& A, const at::Tensor& packed_B,
   return cpu_linear_vsx::bf16_mm(A, packed_B, bias);
 }
 
-#endif  // __powerpc64__
+#endif  // defined(__powerpc__) || defined(__powerpc64__) || defined(__PPC64__)

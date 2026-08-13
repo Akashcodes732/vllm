@@ -200,7 +200,7 @@ void cpu_gemm_wna16(const torch::Tensor& input, const torch::Tensor& q_weight,
 void prepack_moe_weight(const torch::Tensor& weight,
                         torch::Tensor& packed_weight, const std::string& isa);
 
-#ifdef __powerpc64__
+#if defined(__powerpc__) || defined(__powerpc64__) || defined(__PPC64__)
 at::Tensor vsx_pack_weight(at::Tensor& weight);
 at::Tensor vsx_bf16_mm(const at::Tensor& A, const at::Tensor& packed_B,
                         const std::optional<at::Tensor>& bias);
@@ -502,7 +502,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("int8_scaled_mm_with_quant", torch::kCPU,
            &int8_scaled_mm_with_quant);
 
-#ifdef __powerpc64__
+#if defined(__powerpc__) || defined(__powerpc64__) || defined(__PPC64__)
   // Power10 VSX dense BF16 linear with pre-packed weights.
   // Analogous to convert_weight_packed / weight_packed_linear on x86 AMX.
   ops.def("vsx_pack_weight(Tensor! weight) -> Tensor");
@@ -511,7 +511,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "vsx_bf16_mm(Tensor A, Tensor packed_B, Tensor? bias) -> Tensor");
   ops.impl("vsx_bf16_mm", torch::kCPU, &vsx_bf16_mm);
-#endif  // __powerpc64__
+#endif  // defined(__powerpc__) || defined(__powerpc64__) || defined(__PPC64__)
 
   // Adapted from sglang: FP8 W8A16 kernel
   ops.def(
