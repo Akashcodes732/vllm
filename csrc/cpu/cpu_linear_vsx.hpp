@@ -22,6 +22,10 @@
 #include <algorithm>
 #include <optional>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "cpu/micro_gemm/cpu_micro_gemm_impl.hpp"
 #include "cpu/micro_gemm/cpu_micro_gemm_vsx.hpp"
 #include "cpu/utils.hpp"
@@ -67,8 +71,12 @@ inline at::Tensor pack_weight(at::Tensor& weight) {
 // packed_B: BF16 tensor [N, K] in MMA-packed layout (output of pack_weight)
 // bias:     optional BF16 tensor [N]
 //
-// Accumulates in FP32 then converts back to BF16.
-// Uses xvbf16ger2pp MMA for M > 4; scalar VSX FMADD for M <= 4.
+// Parallelized across N-tiles using OpenMP. Each thread accumulates into a
+// stack-allocated per-tile FP32 buffer (MaxM*NTile*4 = 512 bytes) and writes
+// BF16 output directly — no shared mutable state, no synchronization needed.
+//
+// For M <= 4 (decode), TileGemmVSX dispatches to gemm_micro_vsx_fallback
+// (vec_madd path). For M > 4, xvbf16ger2pp MMA is used.
 //
 // Returns:
 //   BF16 tensor [..., N]
@@ -103,66 +111,61 @@ inline at::Tensor bf16_mm(const at::Tensor& A, const at::Tensor& packed_B,
   out_shape.back() = N;
   at::Tensor out_bf16 = at::empty(out_shape, A.options());
 
-  // FP32 accumulation buffer [M, N]
-  at::Tensor c_fp32 =
-      at::empty({M, N}, at::TensorOptions().dtype(at::kFloat));
-
-  // Ensure A is contiguous for sequential row access
   const at::Tensor A_contig = A.contiguous();
   const at::BFloat16* a_ptr = A_contig.data_ptr<at::BFloat16>();
   const at::BFloat16* b_ptr = packed_B.data_ptr<at::BFloat16>();
-  float* c_ptr = c_fp32.data_ptr<float>();
   at::BFloat16* out_ptr = out_bf16.data_ptr<at::BFloat16>();
+  const at::BFloat16* bias_ptr =
+      bias.has_value() ? bias->data_ptr<at::BFloat16>() : nullptr;
 
-  GemmT gemm;
-  constexpr int32_t MaxM = GemmT::MaxMSize;   // 8
-  constexpr int32_t NTile = GemmT::NSize;      // 16
+  constexpr int32_t MaxM = GemmT::MaxMSize;  // 8
+  constexpr int32_t NTile = GemmT::NSize;    // 16
 
-  // b_n_group_stride: stride in elements between consecutive WeightOCGroupSize
-  // (16) N-groups in the packed B tensor. Verified against MoE call pattern:
-  //   gemm(A, B_tile, C, m, k, lda=K, b_n_group_stride=K, ldc, accum_c)
-  const int64_t b_n_group_stride = K;
-  const int64_t lda = K;
-  const int64_t ldc = N;
+  const int32_t num_n_tiles = static_cast<int32_t>(N / NTile);
 
-  // Tile over N (output columns) then M (input rows).
-  // Each N-tile is NTile=16 columns wide.
-  // In the packed layout, consecutive N-tiles are stored contiguously,
-  // each occupying K*NTile elements, so the pointer offset is n_off * K.
-  for (int64_t n_off = 0; n_off < N; n_off += NTile) {
-    const at::BFloat16* b_tile = b_ptr + n_off * K;
+  // Parallel over N-tiles: each thread handles a disjoint column range.
+  // No shared writes — output tiles and stack buffers are per-thread.
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int32_t n_t = 0; n_t < num_n_tiles; ++n_t) {
+    // Per-thread, per-tile FP32 accumulation buffer: 8*16*4 = 512 bytes.
+    // Stack-allocated: zero heap overhead, cache-hot per thread.
+    alignas(64) float c_tile_buf[MaxM * NTile];
+
+    GemmT gemm;
+    const at::BFloat16* b_tile =
+        b_ptr + static_cast<int64_t>(n_t) * NTile * K;
+    at::BFloat16* out_col = out_ptr + n_t * NTile;
+    const at::BFloat16* bias_col =
+        bias_ptr ? bias_ptr + n_t * NTile : nullptr;
 
     for (int64_t m_off = 0; m_off < M; m_off += MaxM) {
       const int32_t m_actual = static_cast<int32_t>(
           std::min(static_cast<int64_t>(MaxM), M - m_off));
 
-      const at::BFloat16* a_tile = a_ptr + m_off * K;
-      float* c_tile = c_ptr + m_off * N + n_off;
-
-      gemm.gemm(const_cast<at::BFloat16*>(a_tile),
-                const_cast<at::BFloat16*>(b_tile), c_tile, m_actual,
-                static_cast<int32_t>(K), lda, b_n_group_stride, ldc,
+      gemm.gemm(const_cast<at::BFloat16*>(a_ptr + m_off * K),
+                const_cast<at::BFloat16*>(b_tile),
+                c_tile_buf,
+                m_actual,
+                static_cast<int32_t>(K),
+                static_cast<int32_t>(K),    // lda
+                static_cast<int32_t>(K),    // b_n_group_stride
+                NTile,                      // ldc = tile width, not full N
                 /*accum_c=*/false);
-    }
-  }
 
-  // Epilogue: FP32 -> BF16, with optional bias.
-  // bias_epilogue / default_epilogue are templated on compile-time n_size=16.
-  // Loop over N-tiles applying the epilogue per tile.
-  const int32_t n_tiles = static_cast<int32_t>(N / NTile);
-  for (int32_t n_t = 0; n_t < n_tiles; ++n_t) {
-    float* c_tile = c_ptr + n_t * NTile;
-    at::BFloat16* out_tile = out_ptr + n_t * NTile;
-
-    if (bias.has_value()) {
-      at::BFloat16* bias_tile =
-          const_cast<at::BFloat16*>(bias->data_ptr<at::BFloat16>()) +
-          n_t * NTile;
-      cpu_micro_gemm::bias_epilogue<NTile, at::BFloat16>(
-          c_tile, out_tile, bias_tile, static_cast<int32_t>(M), ldc, ldc);
-    } else {
-      cpu_micro_gemm::default_epilogue<NTile, at::BFloat16>(
-          c_tile, out_tile, static_cast<int32_t>(M), ldc, ldc);
+      // Epilogue: FP32 tile -> BF16, writing into the correct output column.
+      at::BFloat16* out_tile_row = out_col + m_off * N;
+      if (bias_col) {
+        cpu_micro_gemm::bias_epilogue<NTile, at::BFloat16>(
+            c_tile_buf, out_tile_row,
+            const_cast<at::BFloat16*>(bias_col),
+            m_actual, NTile, static_cast<int32_t>(N));
+      } else {
+        cpu_micro_gemm::default_epilogue<NTile, at::BFloat16>(
+            c_tile_buf, out_tile_row, m_actual, NTile,
+            static_cast<int32_t>(N));
+      }
     }
   }
 
