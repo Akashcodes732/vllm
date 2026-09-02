@@ -112,11 +112,6 @@ class TileGemmVSX {
   static void gemm_micro(DEFINE_CPU_MICRO_GEMM_PARAMS) {
     static_assert(0 < M && M <= 8);
 
-    if constexpr (M <= 4) {
-      gemm_micro_vsx_fallback<M>(CPU_MICRO_GEMM_PARAMS);
-      return;
-    }
-
     // Calculate how many 4x4 tiles we need in M dimension
     constexpr int tiles_m = (M + 3) / 4;
     constexpr int tiles_n =
