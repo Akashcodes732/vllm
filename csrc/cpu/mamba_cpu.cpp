@@ -5,7 +5,7 @@
 // mamba_kernels.hpp.
 
 #include "cpu/mamba_kernels.hpp"
-#include "cpu/mamba_conv1d_vsx.hpp"
+#include "cpu/mamba_vsx_kernels.hpp"
 
 #include <ATen/ATen.h>
 #include <torch/library.h>
@@ -286,6 +286,19 @@ void mamba_chunk_scan_fwd_cpu_impl(
               "raw data_ptr)");
 
   VLLM_DISPATCH_FLOATING_TYPES(input_type, "mamba_chunk_scan_fwd_cpu", [&] {
+#ifdef __powerpc__
+    if (headdim % 8 == 0 && dstate % 8 == 0) {
+      mamba_cpu::vsx::mamba_chunk_scan_fwd<scalar_t>(
+          final_states.data_ptr<float>(), x_in.data_ptr<scalar_t>(),
+          dt_c.data_ptr<float>(), A_f32.data_ptr<float>(),
+          B_in.data_ptr<scalar_t>(), C_in.data_ptr<scalar_t>(),
+          D_f32.defined() ? D_f32.data_ptr<float>() : nullptr,
+          z_in.defined() ? z_in.data_ptr<scalar_t>() : nullptr,
+          out.data_ptr<scalar_t>(), cu_int.data_ptr<int32_t>(), batch, nheads,
+          ngroups, headdim, dstate);
+      return;
+    }
+#endif
     mamba_cpu::mamba_chunk_scan_fwd_kernel<scalar_t>(
         final_states.data_ptr<float>(), x_in.data_ptr<scalar_t>(),
         dt_c.data_ptr<float>(), A_f32.data_ptr<float>(),
