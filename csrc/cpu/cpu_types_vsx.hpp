@@ -160,6 +160,8 @@ struct BF16Vec8 : public Vec<BF16Vec8> {
 
   __vector signed short reg;
 
+  explicit BF16Vec8() = default;
+  explicit BF16Vec8(__vector signed short r) : reg(r) {}
   explicit BF16Vec8(const void* ptr)
       : reg((__vector signed short)vec_xl(0, (__vector signed short*)ptr)) {}
 
@@ -472,6 +474,12 @@ struct FP32Vec8 : public Vec<FP32Vec8> {
       ret.val[i] = vec_sel(erf_val, sign, saturated);
     }
     return FP32Vec8(ret);
+  }
+
+  FP32Vec8 silu() const {
+    const FP32Vec8 zeros(0.0f);
+    const FP32Vec8 ones(1.0f);
+    return *this / (ones + (zeros - *this).exp());
   }
 
   FP32Vec8 operator*(const FP32Vec8& b) const {
@@ -931,6 +939,15 @@ void storeFP32(float v, T* ptr) {
 
 inline void fma(FP32Vec16& acc, FP32Vec16& a, FP32Vec16& b) {
   acc = acc + a * b;
+}
+
+inline void fma(FP32Vec8& acc, const FP32Vec8& a, const FP32Vec8& b) {
+  acc.reg.val[0] = vec_madd(a.reg.val[0], b.reg.val[0], acc.reg.val[0]);
+  acc.reg.val[1] = vec_madd(a.reg.val[1], b.reg.val[1], acc.reg.val[1]);
+}
+
+inline FP32Vec8 silu_act(const FP32Vec8& x) {
+  return x.silu();
 }
 
 template <>

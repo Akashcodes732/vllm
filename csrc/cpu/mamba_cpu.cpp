@@ -5,6 +5,7 @@
 // mamba_kernels.hpp.
 
 #include "cpu/mamba_kernels.hpp"
+#include "cpu/mamba_conv1d_vsx.hpp"
 
 #include <ATen/ATen.h>
 #include <torch/library.h>
@@ -75,6 +76,18 @@ at::Tensor causal_conv1d_update_cpu_impl(
   }
 
   VLLM_DISPATCH_FLOATING_TYPES(dtype, "causal_conv1d_update", [&] {
+#ifdef __powerpc__
+    if (width == 4 && state_len == 3 && seqlen == 1 && stride_s_dim == 1 && (dim % 8 == 0)) {
+      mamba_cpu::vsx::causal_conv1d_update<scalar_t>(
+          x_c.data_ptr<scalar_t>(), state_c.data_ptr<scalar_t>(), stride_s_slot,
+          stride_s_dim, stride_s_state, w_c.data_ptr<scalar_t>(),
+          bias_f32.defined() ? bias_f32.data_ptr<float>() : nullptr,
+          out.data_ptr<scalar_t>(), cache_idx_ptr,
+          static_cast<int32_t>(pad_slot_id), batch, dim, seqlen, width, state_len,
+          do_silu);
+      return;
+    }
+#endif
     mamba_cpu::causal_conv1d_update_kernel<scalar_t>(
         x_c.data_ptr<scalar_t>(), state_c.data_ptr<scalar_t>(), stride_s_slot,
         stride_s_dim, stride_s_state, w_c.data_ptr<scalar_t>(),
