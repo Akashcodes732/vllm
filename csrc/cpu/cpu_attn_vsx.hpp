@@ -433,7 +433,7 @@ FORCE_INLINE void gemm_macro_mma_Nx32(
   }
 }
 
-template <typename kv_cache_t>
+template <typename kv_cache_t, int64_t head_dim = -1>
 class TileGemmPPC64 {
  public:
   using prob_t = std::conditional_t<std::is_same_v<kv_cache_t, float>, float,
@@ -454,16 +454,18 @@ class TileGemmPPC64 {
           k_size, lda, ldb, ldc, accum_c);
     } else {
       if constexpr (std::is_same_v<kv_cache_t, c10::BFloat16>) {
-        if (m_size >= 4) {
-          gemm_macro_mma_Nx32<HEAD_SIZE_ALIGNMENT>(
-              reinterpret_cast<const c10::BFloat16*>(a_tile),
-              reinterpret_cast<const c10::BFloat16*>(b_tile), c_tile, m_size,
-              dynamic_k_size, lda, ldb, ldc, accum_c);
-        } else {
-          gemm_macro_ppc64le_Mx8_Ku4<HEAD_SIZE_ALIGNMENT, prob_t, kv_cache_t>(
-              reinterpret_cast<const prob_t*>(a_tile), b_tile, c_tile, m_size,
-              dynamic_k_size, lda, ldb, ldc, accum_c);
+        if constexpr (head_dim >= 256 || head_dim == -1) {
+          if ((head_dim >= 256 || ldc >= 256) && m_size >= 4) {
+            gemm_macro_mma_Nx32<HEAD_SIZE_ALIGNMENT>(
+                reinterpret_cast<const c10::BFloat16*>(a_tile),
+                reinterpret_cast<const c10::BFloat16*>(b_tile), c_tile, m_size,
+                dynamic_k_size, lda, ldb, ldc, accum_c);
+            return;
+          }
         }
+        gemm_macro_ppc64le_Mx8_Ku4<HEAD_SIZE_ALIGNMENT, prob_t, kv_cache_t>(
+            reinterpret_cast<const prob_t*>(a_tile), b_tile, c_tile, m_size,
+            dynamic_k_size, lda, ldb, ldc, accum_c);
       } else {
         gemm_macro_ppc64le_Mx8_Ku4<HEAD_SIZE_ALIGNMENT, prob_t, kv_cache_t>(
             reinterpret_cast<const prob_t*>(a_tile), b_tile, c_tile, m_size,
@@ -499,7 +501,7 @@ class AttentionImpl<ISA::VSX, scalar_t, head_dim> {
 
   template <template <typename tile_gemm_t> typename attention>
   FORCE_INLINE void execute_attention(DEFINE_CPU_ATTENTION_PARAMS) {
-    attention<TileGemmPPC64<kv_cache_t>> attention_iteration;
+    attention<TileGemmPPC64<kv_cache_t, head_dim>> attention_iteration;
     attention_iteration(CPU_ATTENTION_PARAMS);
   }
 
