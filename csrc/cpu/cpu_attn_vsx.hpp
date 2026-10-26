@@ -16,11 +16,15 @@ namespace {
 #define HEAD_SIZE_ALIGNMENT 32
 #define MAX_Q_HEAD_NUM_PER_ITER 16
 
+typedef uint64_t __attribute__((aligned(1))) unaligned_u64;
+typedef uint32_t __attribute__((aligned(1))) unaligned_u32;
+typedef uint16_t __attribute__((aligned(1))) unaligned_u16;
+
 template <typename kv_cache_t>
 FORCE_INLINE void load_row8_B_as_f32(const kv_cache_t* p, __vector float& b0,
                                      __vector float& b1);
 
-// [1] Float Specialization
+// [1] Float Specialization for 8 elements of B
 template <>
 FORCE_INLINE void load_row8_B_as_f32<float>(const float* p, __vector float& b0,
                                             __vector float& b1) {
@@ -28,15 +32,7 @@ FORCE_INLINE void load_row8_B_as_f32<float>(const float* p, __vector float& b0,
   b1 = vec_xl(0, const_cast<float*>(p + 4));
 }
 
-// [2] BFloat16 Specialization (Little Endian ppc64le)
-// On ppc64le (LE): BF16 bits should land in the HIGH 16 bits of each float32.
-// Byte layout of float32 on LE: [byte0(LSB), byte1, byte2, byte3(MSB)]
-// We need BF16 in bytes2-3 (high half) with bytes0-1 zeroed.
-// vec_mergeh on LE interleaves elements 0..3: result_i = {a[i], b[i]}
-// So vec_mergeh(zeros_u16, raw_u16) gives for each uint16 pair:
-//   uint16[2i]   = zeros[i]  -> low 16 bits of uint32  -> zeroed mantissa LSBs
-//   uint16[2i+1] = raw[i]    -> high 16 bits of uint32 -> BF16 bits
-// Cast to float32 gives exactly (bf16_bits << 16) per element.
+// [2] BFloat16 Specialization for 8 elements of B (Little Endian ppc64le)
 template <>
 FORCE_INLINE void load_row8_B_as_f32<c10::BFloat16>(const c10::BFloat16* p,
                                                     __vector float& b0,
@@ -45,12 +41,12 @@ FORCE_INLINE void load_row8_B_as_f32<c10::BFloat16>(const c10::BFloat16* p,
       0, reinterpret_cast<unsigned short*>(const_cast<c10::BFloat16*>(p)));
   __vector unsigned short zeros = vec_splat_u16(0);
 
-  // LE: zeros in low 16 bits, raw in high 16 bits → bf16 << 16 == float32
+  // LE: zeros in low 16 bits, raw in high 16 bits -> bf16 << 16 == float32
   b0 = (__vector float)vec_mergeh(zeros, raw);
   b1 = (__vector float)vec_mergel(zeros, raw);
 }
 
-// [3] Half (FP16) Specialization
+// [3] Half (FP16) Specialization for 8 elements of B
 template <>
 FORCE_INLINE void load_row8_B_as_f32<c10::Half>(const c10::Half* p,
                                                 __vector float& b0,
@@ -61,13 +57,81 @@ FORCE_INLINE void load_row8_B_as_f32<c10::Half>(const c10::Half* p,
   b1 = fp32_vec.reg.val[1];
 }
 
+template <typename kv_cache_t>
+FORCE_INLINE void load_row16_B_as_f32(const kv_cache_t* p,
+                                      __vector float& b0,
+                                      __vector float& b1,
+                                      __vector float& b2,
+                                      __vector float& b3);
+
+// [1] Float Specialization for 16 elements of B
+template <>
+FORCE_INLINE void load_row16_B_as_f32<float>(const float* p,
+                                             __vector float& b0,
+                                             __vector float& b1,
+                                             __vector float& b2,
+                                             __vector float& b3) {
+  b0 = vec_xl(0, const_cast<float*>(p + 0));
+  b1 = vec_xl(0, const_cast<float*>(p + 4));
+  b2 = vec_xl(0, const_cast<float*>(p + 8));
+  b3 = vec_xl(0, const_cast<float*>(p + 12));
+}
+
+// [2] BFloat16 Specialization for 16 elements of B
+template <>
+FORCE_INLINE void load_row16_B_as_f32<c10::BFloat16>(const c10::BFloat16* p,
+                                                     __vector float& b0,
+                                                     __vector float& b1,
+                                                     __vector float& b2,
+                                                     __vector float& b3) {
+  const auto* u = reinterpret_cast<const unsigned short*>(p);
+  __vector unsigned short raw0 = vec_xl(0, const_cast<unsigned short*>(u + 0));
+  __vector unsigned short raw1 = vec_xl(0, const_cast<unsigned short*>(u + 8));
+  __vector unsigned short zeros = vec_splat_u16(0);
+
+  b0 = (__vector float)vec_mergeh(zeros, raw0);
+  b1 = (__vector float)vec_mergel(zeros, raw0);
+  b2 = (__vector float)vec_mergeh(zeros, raw1);
+  b3 = (__vector float)vec_mergel(zeros, raw1);
+}
+
+// [3] Half (FP16) Specialization for 16 elements of B
+template <>
+FORCE_INLINE void load_row16_B_as_f32<c10::Half>(const c10::Half* p,
+                                                 __vector float& b0,
+                                                 __vector float& b1,
+                                                 __vector float& b2,
+                                                 __vector float& b3) {
+  load_row8_B_as_f32<c10::Half>(p + 0, b0, b1);
+  load_row8_B_as_f32<c10::Half>(p + 8, b2, b3);
+}
+
+// Load 8 values of A and convert to two float vectors (8 floats)
+template <typename a_t>
+FORCE_INLINE void load_row8_A_as_f32(const a_t* p, __vector float& a0,
+                                     __vector float& a1) {
+  if constexpr (std::is_same_v<a_t, float>) {
+    a0 = vec_xl(0, const_cast<float*>(p + 0));
+    a1 = vec_xl(0, const_cast<float*>(p + 4));
+  } else if constexpr (std::is_same_v<a_t, c10::BFloat16>) {
+    __vector unsigned short raw = vec_xl(
+        0, reinterpret_cast<unsigned short*>(const_cast<c10::BFloat16*>(p)));
+    __vector unsigned short zeros = vec_splat_u16(0);
+    a0 = (__vector float)vec_mergeh(zeros, raw);
+    a1 = (__vector float)vec_mergel(zeros, raw);
+  } else {
+    static_assert(sizeof(a_t) == 0,
+                  "Unsupported a_t type for load_row8_A_as_f32");
+  }
+}
+
+// Load 4 values of A and convert to one float vector (4 floats) without memcpy
 template <typename a_t>
 FORCE_INLINE void load_row4_A_as_f32(const a_t* p, __vector float& a) {
   if constexpr (std::is_same_v<a_t, float>) {
     a = vec_xl(0, const_cast<float*>(p));
   } else if constexpr (std::is_same_v<a_t, c10::BFloat16>) {
-    uint64_t raw64;
-    std::memcpy(&raw64, p, sizeof(raw64));
+    uint64_t raw64 = *reinterpret_cast<const unaligned_u64*>(p);
     __vector unsigned long long v64 = {raw64, 0};
     __vector unsigned short raw = (__vector unsigned short)v64;
     __vector unsigned short zeros = vec_splat_u16(0);
@@ -78,11 +142,12 @@ FORCE_INLINE void load_row4_A_as_f32(const a_t* p, __vector float& a) {
   }
 }
 
+// High-performance 16-column VSX microkernel with K unroll = 8
 template <int32_t M, typename a_t, typename kv_cache_t>
-FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku4(
+FORCE_INLINE void gemm_micro_ppc64le_Mx16_Ku8(
     const a_t* __restrict A,         // [M x K]
-    const kv_cache_t* __restrict B,  // [K x 8]
-    float* __restrict C,             // [M x 8]
+    const kv_cache_t* __restrict B,  // [K x 16]
+    float* __restrict C,             // [M x 16]
     int64_t lda, int64_t ldb, int64_t ldc, int32_t K, bool accumulate) {
   static_assert(1 <= M && M <= 8, "M must be in [1,8]");
 
@@ -94,12 +159,204 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku4(
   ROWS_APPLY(DECL_A)
 #undef DECL_A
 
-  // 2. Define Accumulators (2 vectors covers 8 columns)
-#define DECL_ACC(i) __vector float acc##i##_0, acc##i##_1;
+  // 2. Define Accumulators (4 vectors cover 16 columns)
+#define DECL_ACC(i) __vector float acc##i##_0, acc##i##_1, acc##i##_2, acc##i##_3;
   ROWS_APPLY(DECL_ACC)
 #undef DECL_ACC
 
   // 3. Initialize Accumulators (Load C or Zero)
+#define INIT_ACC(i)                                                    \
+  IF_M(i) {                                                            \
+    if (accumulate) {                                                  \
+      acc##i##_0 = vec_xl(0, const_cast<float*>(C + (i) * ldc + 0));   \
+      acc##i##_1 = vec_xl(0, const_cast<float*>(C + (i) * ldc + 4));   \
+      acc##i##_2 = vec_xl(0, const_cast<float*>(C + (i) * ldc + 8));   \
+      acc##i##_3 = vec_xl(0, const_cast<float*>(C + (i) * ldc + 12));  \
+    } else {                                                           \
+      acc##i##_0 = vec_splats(0.0f);                                   \
+      acc##i##_1 = vec_splats(0.0f);                                   \
+      acc##i##_2 = vec_splats(0.0f);                                   \
+      acc##i##_3 = vec_splats(0.0f);                                   \
+    }                                                                  \
+  }
+  ROWS_APPLY(INIT_ACC)
+#undef INIT_ACC
+
+  int32_t k = 0;
+
+  for (; k + 7 < K; k += 8) {
+#define LOAD_A8(i)                                \
+  __vector float a##i##_03, a##i##_47;            \
+  IF_M(i) load_row8_A_as_f32<a_t>(a##i + k, a##i##_03, a##i##_47);
+    ROWS_APPLY(LOAD_A8)
+#undef LOAD_A8
+
+#define FMAS_LANE(i, aiv, L)                        \
+  IF_M(i) {                                         \
+    __vector float a_broad = vec_splat(aiv, L);     \
+    acc##i##_0 = vec_madd(b0, a_broad, acc##i##_0); \
+    acc##i##_1 = vec_madd(b1, a_broad, acc##i##_1); \
+    acc##i##_2 = vec_madd(b2, a_broad, acc##i##_2); \
+    acc##i##_3 = vec_madd(b3, a_broad, acc##i##_3); \
+  }
+
+    {
+      __vector float b0, b1, b2, b3;
+      load_row16_B_as_f32<kv_cache_t>(B + (int64_t)(k + 0) * ldb, b0, b1, b2, b3);
+#define STEP0(i) FMAS_LANE(i, a##i##_03, 0)
+      ROWS_APPLY(STEP0)
+#undef STEP0
+    }
+    {
+      __vector float b0, b1, b2, b3;
+      load_row16_B_as_f32<kv_cache_t>(B + (int64_t)(k + 1) * ldb, b0, b1, b2, b3);
+#define STEP1(i) FMAS_LANE(i, a##i##_03, 1)
+      ROWS_APPLY(STEP1)
+#undef STEP1
+    }
+    {
+      __vector float b0, b1, b2, b3;
+      load_row16_B_as_f32<kv_cache_t>(B + (int64_t)(k + 2) * ldb, b0, b1, b2, b3);
+#define STEP2(i) FMAS_LANE(i, a##i##_03, 2)
+      ROWS_APPLY(STEP2)
+#undef STEP2
+    }
+    {
+      __vector float b0, b1, b2, b3;
+      load_row16_B_as_f32<kv_cache_t>(B + (int64_t)(k + 3) * ldb, b0, b1, b2, b3);
+#define STEP3(i) FMAS_LANE(i, a##i##_03, 3)
+      ROWS_APPLY(STEP3)
+#undef STEP3
+    }
+    {
+      __vector float b0, b1, b2, b3;
+      load_row16_B_as_f32<kv_cache_t>(B + (int64_t)(k + 4) * ldb, b0, b1, b2, b3);
+#define STEP4(i) FMAS_LANE(i, a##i##_47, 0)
+      ROWS_APPLY(STEP4)
+#undef STEP4
+    }
+    {
+      __vector float b0, b1, b2, b3;
+      load_row16_B_as_f32<kv_cache_t>(B + (int64_t)(k + 5) * ldb, b0, b1, b2, b3);
+#define STEP5(i) FMAS_LANE(i, a##i##_47, 1)
+      ROWS_APPLY(STEP5)
+#undef STEP5
+    }
+    {
+      __vector float b0, b1, b2, b3;
+      load_row16_B_as_f32<kv_cache_t>(B + (int64_t)(k + 6) * ldb, b0, b1, b2, b3);
+#define STEP6(i) FMAS_LANE(i, a##i##_47, 2)
+      ROWS_APPLY(STEP6)
+#undef STEP6
+    }
+    {
+      __vector float b0, b1, b2, b3;
+      load_row16_B_as_f32<kv_cache_t>(B + (int64_t)(k + 7) * ldb, b0, b1, b2, b3);
+#define STEP7(i) FMAS_LANE(i, a##i##_47, 3)
+      ROWS_APPLY(STEP7)
+#undef STEP7
+    }
+#undef FMAS_LANE
+  }
+
+  // Remainder Ku4
+  if (k + 3 < K) {
+#define LOAD_A4(i)                           \
+  __vector float a##i##_03;                  \
+  IF_M(i) load_row4_A_as_f32<a_t>(a##i + k, a##i##_03);
+    ROWS_APPLY(LOAD_A4)
+#undef LOAD_A4
+
+#define FMAS_LANE(i, aiv, L)                        \
+  IF_M(i) {                                         \
+    __vector float a_broad = vec_splat(aiv, L);     \
+    acc##i##_0 = vec_madd(b0, a_broad, acc##i##_0); \
+    acc##i##_1 = vec_madd(b1, a_broad, acc##i##_1); \
+    acc##i##_2 = vec_madd(b2, a_broad, acc##i##_2); \
+    acc##i##_3 = vec_madd(b3, a_broad, acc##i##_3); \
+  }
+    {
+      __vector float b0, b1, b2, b3;
+      load_row16_B_as_f32<kv_cache_t>(B + (int64_t)(k + 0) * ldb, b0, b1, b2, b3);
+#define STEP0(i) FMAS_LANE(i, a##i##_03, 0)
+      ROWS_APPLY(STEP0)
+#undef STEP0
+    }
+    {
+      __vector float b0, b1, b2, b3;
+      load_row16_B_as_f32<kv_cache_t>(B + (int64_t)(k + 1) * ldb, b0, b1, b2, b3);
+#define STEP1(i) FMAS_LANE(i, a##i##_03, 1)
+      ROWS_APPLY(STEP1)
+#undef STEP1
+    }
+    {
+      __vector float b0, b1, b2, b3;
+      load_row16_B_as_f32<kv_cache_t>(B + (int64_t)(k + 2) * ldb, b0, b1, b2, b3);
+#define STEP2(i) FMAS_LANE(i, a##i##_03, 2)
+      ROWS_APPLY(STEP2)
+#undef STEP2
+    }
+    {
+      __vector float b0, b1, b2, b3;
+      load_row16_B_as_f32<kv_cache_t>(B + (int64_t)(k + 3) * ldb, b0, b1, b2, b3);
+#define STEP3(i) FMAS_LANE(i, a##i##_03, 3)
+      ROWS_APPLY(STEP3)
+#undef STEP3
+    }
+#undef FMAS_LANE
+    k += 4;
+  }
+
+  // Scalar tail for remaining 1..3 elements
+  for (; k < K; ++k) {
+    __vector float b0, b1, b2, b3;
+    load_row16_B_as_f32<kv_cache_t>(B + (int64_t)k * ldb, b0, b1, b2, b3);
+#define TAIL_ROW(i)                                                     \
+  IF_M(i) {                                                             \
+    __vector float ai = vec_splats(static_cast<float>(*(a##i + k)));   \
+    acc##i##_0 = vec_madd(b0, ai, acc##i##_0);                          \
+    acc##i##_1 = vec_madd(b1, ai, acc##i##_1);                          \
+    acc##i##_2 = vec_madd(b2, ai, acc##i##_2);                          \
+    acc##i##_3 = vec_madd(b3, ai, acc##i##_3);                          \
+  }
+    ROWS_APPLY(TAIL_ROW)
+#undef TAIL_ROW
+  }
+
+#define STORE_ROW(i)                             \
+  IF_M(i) {                                      \
+    vec_xst(acc##i##_0, 0, C + (i) * ldc + 0);   \
+    vec_xst(acc##i##_1, 0, C + (i) * ldc + 4);   \
+    vec_xst(acc##i##_2, 0, C + (i) * ldc + 8);   \
+    vec_xst(acc##i##_3, 0, C + (i) * ldc + 12);  \
+  }
+  ROWS_APPLY(STORE_ROW)
+#undef STORE_ROW
+
+#undef ROWS_APPLY
+#undef IF_M
+}
+
+// 8-column VSX microkernel with K unroll = 8
+template <int32_t M, typename a_t, typename kv_cache_t>
+FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku8(
+    const a_t* __restrict A,         // [M x K]
+    const kv_cache_t* __restrict B,  // [K x 8]
+    float* __restrict C,             // [M x 8]
+    int64_t lda, int64_t ldb, int64_t ldc, int32_t K, bool accumulate) {
+  static_assert(1 <= M && M <= 8, "M must be in [1,8]");
+
+#define ROWS_APPLY(OP) OP(0) OP(1) OP(2) OP(3) OP(4) OP(5) OP(6) OP(7)
+#define IF_M(i) if constexpr (M > (i))
+
+#define DECL_A(i) const a_t* a##i = A + (i) * lda;
+  ROWS_APPLY(DECL_A)
+#undef DECL_A
+
+#define DECL_ACC(i) __vector float acc##i##_0, acc##i##_1;
+  ROWS_APPLY(DECL_ACC)
+#undef DECL_ACC
+
 #define INIT_ACC(i)                                                  \
   IF_M(i) {                                                          \
     if (accumulate) {                                                \
@@ -115,16 +372,13 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku4(
 
   int32_t k = 0;
 
-  for (; k + 3 < K; k += 4) {
-    // Load 4 values of A for each Row M: A[k...k+3]
-#define LOAD_A4(i)        \
-  __vector float a##i##v; \
-  IF_M(i) load_row4_A_as_f32<a_t>(a##i + k, a##i##v);
-    ROWS_APPLY(LOAD_A4)
-#undef LOAD_A4
+  for (; k + 7 < K; k += 8) {
+#define LOAD_A8(i)                                \
+  __vector float a##i##_03, a##i##_47;            \
+  IF_M(i) load_row8_A_as_f32<a_t>(a##i + k, a##i##_03, a##i##_47);
+    ROWS_APPLY(LOAD_A8)
+#undef LOAD_A8
 
-    // FMA for specific lane L of A
-    // ppc64le: vec_madd(b, vec_splat(a, lane), acc)
 #define FMAS_LANE(i, aiv, L)                        \
   IF_M(i) {                                         \
     __vector float a_broad = vec_splat(aiv, L);     \
@@ -132,36 +386,108 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku4(
     acc##i##_1 = vec_madd(b1, a_broad, acc##i##_1); \
   }
 
-    // Unroll K=0..3
     {
       __vector float b0, b1;
       load_row8_B_as_f32<kv_cache_t>(B + (int64_t)(k + 0) * ldb, b0, b1);
-#define STEP_K0(i) FMAS_LANE(i, a##i##v, 0)
-      ROWS_APPLY(STEP_K0)
-#undef STEP_K0
+#define STEP0(i) FMAS_LANE(i, a##i##_03, 0)
+      ROWS_APPLY(STEP0)
+#undef STEP0
     }
     {
       __vector float b0, b1;
       load_row8_B_as_f32<kv_cache_t>(B + (int64_t)(k + 1) * ldb, b0, b1);
-#define STEP_K1(i) FMAS_LANE(i, a##i##v, 1)
-      ROWS_APPLY(STEP_K1)
-#undef STEP_K1
+#define STEP1(i) FMAS_LANE(i, a##i##_03, 1)
+      ROWS_APPLY(STEP1)
+#undef STEP1
     }
     {
       __vector float b0, b1;
       load_row8_B_as_f32<kv_cache_t>(B + (int64_t)(k + 2) * ldb, b0, b1);
-#define STEP_K2(i) FMAS_LANE(i, a##i##v, 2)
-      ROWS_APPLY(STEP_K2)
-#undef STEP_K2
+#define STEP2(i) FMAS_LANE(i, a##i##_03, 2)
+      ROWS_APPLY(STEP2)
+#undef STEP2
     }
     {
       __vector float b0, b1;
       load_row8_B_as_f32<kv_cache_t>(B + (int64_t)(k + 3) * ldb, b0, b1);
-#define STEP_K3(i) FMAS_LANE(i, a##i##v, 3)
-      ROWS_APPLY(STEP_K3)
-#undef STEP_K3
+#define STEP3(i) FMAS_LANE(i, a##i##_03, 3)
+      ROWS_APPLY(STEP3)
+#undef STEP3
+    }
+    {
+      __vector float b0, b1;
+      load_row8_B_as_f32<kv_cache_t>(B + (int64_t)(k + 4) * ldb, b0, b1);
+#define STEP4(i) FMAS_LANE(i, a##i##_47, 0)
+      ROWS_APPLY(STEP4)
+#undef STEP4
+    }
+    {
+      __vector float b0, b1;
+      load_row8_B_as_f32<kv_cache_t>(B + (int64_t)(k + 5) * ldb, b0, b1);
+#define STEP5(i) FMAS_LANE(i, a##i##_47, 1)
+      ROWS_APPLY(STEP5)
+#undef STEP5
+    }
+    {
+      __vector float b0, b1;
+      load_row8_B_as_f32<kv_cache_t>(B + (int64_t)(k + 6) * ldb, b0, b1);
+#define STEP6(i) FMAS_LANE(i, a##i##_47, 2)
+      ROWS_APPLY(STEP6)
+#undef STEP6
+    }
+    {
+      __vector float b0, b1;
+      load_row8_B_as_f32<kv_cache_t>(B + (int64_t)(k + 7) * ldb, b0, b1);
+#define STEP7(i) FMAS_LANE(i, a##i##_47, 3)
+      ROWS_APPLY(STEP7)
+#undef STEP7
     }
 #undef FMAS_LANE
+  }
+
+  if (k + 3 < K) {
+#define LOAD_A4(i)                           \
+  __vector float a##i##_03;                  \
+  IF_M(i) load_row4_A_as_f32<a_t>(a##i + k, a##i##_03);
+    ROWS_APPLY(LOAD_A4)
+#undef LOAD_A4
+
+#define FMAS_LANE(i, aiv, L)                        \
+  IF_M(i) {                                         \
+    __vector float a_broad = vec_splat(aiv, L);     \
+    acc##i##_0 = vec_madd(b0, a_broad, acc##i##_0); \
+    acc##i##_1 = vec_madd(b1, a_broad, acc##i##_1); \
+  }
+    {
+      __vector float b0, b1;
+      load_row8_B_as_f32<kv_cache_t>(B + (int64_t)(k + 0) * ldb, b0, b1);
+#define STEP0(i) FMAS_LANE(i, a##i##_03, 0)
+      ROWS_APPLY(STEP0)
+#undef STEP0
+    }
+    {
+      __vector float b0, b1;
+      load_row8_B_as_f32<kv_cache_t>(B + (int64_t)(k + 1) * ldb, b0, b1);
+#define STEP1(i) FMAS_LANE(i, a##i##_03, 1)
+      ROWS_APPLY(STEP1)
+#undef STEP1
+    }
+    {
+      __vector float b0, b1;
+      load_row8_B_as_f32<kv_cache_t>(B + (int64_t)(k + 2) * ldb, b0, b1);
+#define STEP2(i) FMAS_LANE(i, a##i##_03, 2)
+      ROWS_APPLY(STEP2)
+#undef STEP2
+    }
+    {
+      __vector float b0, b1;
+      load_row8_B_as_f32<kv_cache_t>(B + (int64_t)(k + 3) * ldb, b0, b1);
+#define STEP3(i) FMAS_LANE(i, a##i##_03, 3)
+      ROWS_APPLY(STEP3)
+#undef STEP3
+    }
+#undef FMAS_LANE
+    k += 4;
   }
 
   for (; k < K; ++k) {
@@ -189,6 +515,81 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku4(
 #undef IF_M
 }
 
+// Backward compatibility wrapper
+template <int32_t M, typename a_t, typename kv_cache_t>
+FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku4(
+    const a_t* __restrict A, const kv_cache_t* __restrict B,
+    float* __restrict C, int64_t lda, int64_t ldb, int64_t ldc, int32_t K,
+    bool accumulate) {
+  gemm_micro_ppc64le_Mx8_Ku8<M, a_t, kv_cache_t>(A, B, C, lda, ldb, ldc, K,
+                                                 accumulate);
+}
+
+// Macro GEMM using 16-column tiles with 8-column remainder
+template <int32_t N, typename a_t, typename kv_cache_t>
+FORCE_INLINE void gemm_macro_ppc64le(const a_t* __restrict A,
+                                     const kv_cache_t* __restrict B,
+                                     float* __restrict C, int32_t M,
+                                     int32_t K, int64_t lda,
+                                     int64_t ldb, int64_t ldc,
+                                     bool accumulate) {
+  static_assert(N % 8 == 0, "N must be a multiple of 8");
+  for (int32_t m = 0; m < M;) {
+    int32_t mb = (M - m >= 8) ? 8 : (M - m >= 4) ? 4 : (M - m >= 2) ? 2 : 1;
+    const a_t* Ab = A + m * lda;
+    float* Cb = C + m * ldc;
+
+    int32_t n = 0;
+    for (; n + 15 < N; n += 16) {
+      const kv_cache_t* Bn = B + n;
+      float* Cn = Cb + n;
+      switch (mb) {
+        case 8:
+          gemm_micro_ppc64le_Mx16_Ku8<8, a_t, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
+                                                           K, accumulate);
+          break;
+        case 4:
+          gemm_micro_ppc64le_Mx16_Ku8<4, a_t, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
+                                                           K, accumulate);
+          break;
+        case 2:
+          gemm_micro_ppc64le_Mx16_Ku8<2, a_t, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
+                                                           K, accumulate);
+          break;
+        default:
+          gemm_micro_ppc64le_Mx16_Ku8<1, a_t, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
+                                                           K, accumulate);
+          break;
+      }
+    }
+
+    for (; n + 7 < N; n += 8) {
+      const kv_cache_t* Bn = B + n;
+      float* Cn = Cb + n;
+      switch (mb) {
+        case 8:
+          gemm_micro_ppc64le_Mx8_Ku8<8, a_t, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
+                                                          K, accumulate);
+          break;
+        case 4:
+          gemm_micro_ppc64le_Mx8_Ku8<4, a_t, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
+                                                          K, accumulate);
+          break;
+        case 2:
+          gemm_micro_ppc64le_Mx8_Ku8<2, a_t, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
+                                                          K, accumulate);
+          break;
+        default:
+          gemm_micro_ppc64le_Mx8_Ku8<1, a_t, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
+                                                          K, accumulate);
+          break;
+      }
+    }
+    m += mb;
+  }
+}
+
+// Backward compatibility alias for gemm_macro_ppc64le_Mx8_Ku4
 template <int32_t N, typename a_t, typename kv_cache_t>
 FORCE_INLINE void gemm_macro_ppc64le_Mx8_Ku4(const a_t* __restrict A,
                                              const kv_cache_t* __restrict B,
@@ -196,36 +597,8 @@ FORCE_INLINE void gemm_macro_ppc64le_Mx8_Ku4(const a_t* __restrict A,
                                              int32_t K, int64_t lda,
                                              int64_t ldb, int64_t ldc,
                                              bool accumulate) {
-  static_assert(N % 8 == 0, "N must be a multiple of 8");
-  for (int32_t m = 0; m < M;) {
-    int32_t mb = (M - m >= 8) ? 8 : (M - m >= 4) ? 4 : (M - m >= 2) ? 2 : 1;
-    const a_t* Ab = A + m * lda;
-    float* Cb = C + m * ldc;
-
-    for (int32_t n = 0; n < N; n += 8) {
-      const kv_cache_t* Bn = B + n;
-      float* Cn = Cb + n;
-      switch (mb) {
-        case 8:
-          gemm_micro_ppc64le_Mx8_Ku4<8, a_t, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
-                                                         K, accumulate);
-          break;
-        case 4:
-          gemm_micro_ppc64le_Mx8_Ku4<4, a_t, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
-                                                         K, accumulate);
-          break;
-        case 2:
-          gemm_micro_ppc64le_Mx8_Ku4<2, a_t, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
-                                                         K, accumulate);
-          break;
-        default:
-          gemm_micro_ppc64le_Mx8_Ku4<1, a_t, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
-                                                         K, accumulate);
-          break;
-      }
-    }
-    m += mb;
-  }
+  gemm_macro_ppc64le<N, a_t, kv_cache_t>(A, B, C, M, K, lda, ldb, ldc,
+                                         accumulate);
 }
 
 template <int32_t M>
@@ -259,26 +632,22 @@ gemm_micro_mma_Mx32_Ku2(const c10::BFloat16* __restrict A,
   for (; k + 1 < K; k += 2) {
     __vector unsigned int va;
     if constexpr (M == 1) {
-      uint32_t a0;
-      std::memcpy(&a0, A + k, 4);
+      uint32_t a0 = *reinterpret_cast<const unaligned_u32*>(A + k);
       va = (__vector unsigned int){a0, 0, 0, 0};
     } else if constexpr (M == 2) {
-      uint32_t a0, a1;
-      std::memcpy(&a0, A + 0 * lda + k, 4);
-      std::memcpy(&a1, A + 1 * lda + k, 4);
+      uint32_t a0 = *reinterpret_cast<const unaligned_u32*>(A + 0 * lda + k);
+      uint32_t a1 = *reinterpret_cast<const unaligned_u32*>(A + 1 * lda + k);
       va = (__vector unsigned int){a0, a1, 0, 0};
     } else if constexpr (M == 3) {
-      uint32_t a0, a1, a2;
-      std::memcpy(&a0, A + 0 * lda + k, 4);
-      std::memcpy(&a1, A + 1 * lda + k, 4);
-      std::memcpy(&a2, A + 2 * lda + k, 4);
+      uint32_t a0 = *reinterpret_cast<const unaligned_u32*>(A + 0 * lda + k);
+      uint32_t a1 = *reinterpret_cast<const unaligned_u32*>(A + 1 * lda + k);
+      uint32_t a2 = *reinterpret_cast<const unaligned_u32*>(A + 2 * lda + k);
       va = (__vector unsigned int){a0, a1, a2, 0};
     } else if constexpr (M == 4) {
-      uint32_t a0, a1, a2, a3;
-      std::memcpy(&a0, A + 0 * lda + k, 4);
-      std::memcpy(&a1, A + 1 * lda + k, 4);
-      std::memcpy(&a2, A + 2 * lda + k, 4);
-      std::memcpy(&a3, A + 3 * lda + k, 4);
+      uint32_t a0 = *reinterpret_cast<const unaligned_u32*>(A + 0 * lda + k);
+      uint32_t a1 = *reinterpret_cast<const unaligned_u32*>(A + 1 * lda + k);
+      uint32_t a2 = *reinterpret_cast<const unaligned_u32*>(A + 2 * lda + k);
+      uint32_t a3 = *reinterpret_cast<const unaligned_u32*>(A + 3 * lda + k);
       va = (__vector unsigned int){a0, a1, a2, a3};
     }
     const __vector unsigned char avec = (__vector unsigned char)va;
@@ -320,29 +689,25 @@ gemm_micro_mma_Mx32_Ku2(const c10::BFloat16* __restrict A,
   if (k < K) {
     __vector unsigned int va;
     if constexpr (M == 1) {
-      uint16_t a0;
-      std::memcpy(&a0, A + k, 2);
+      uint16_t a0 = *reinterpret_cast<const unaligned_u16*>(A + k);
       va = (__vector unsigned int){static_cast<uint32_t>(a0), 0, 0, 0};
     } else if constexpr (M == 2) {
-      uint16_t a0, a1;
-      std::memcpy(&a0, A + 0 * lda + k, 2);
-      std::memcpy(&a1, A + 1 * lda + k, 2);
+      uint16_t a0 = *reinterpret_cast<const unaligned_u16*>(A + 0 * lda + k);
+      uint16_t a1 = *reinterpret_cast<const unaligned_u16*>(A + 1 * lda + k);
       va = (__vector unsigned int){static_cast<uint32_t>(a0),
                                    static_cast<uint32_t>(a1), 0, 0};
     } else if constexpr (M == 3) {
-      uint16_t a0, a1, a2;
-      std::memcpy(&a0, A + 0 * lda + k, 2);
-      std::memcpy(&a1, A + 1 * lda + k, 2);
-      std::memcpy(&a2, A + 2 * lda + k, 2);
+      uint16_t a0 = *reinterpret_cast<const unaligned_u16*>(A + 0 * lda + k);
+      uint16_t a1 = *reinterpret_cast<const unaligned_u16*>(A + 1 * lda + k);
+      uint16_t a2 = *reinterpret_cast<const unaligned_u16*>(A + 2 * lda + k);
       va = (__vector unsigned int){static_cast<uint32_t>(a0),
                                    static_cast<uint32_t>(a1),
                                    static_cast<uint32_t>(a2), 0};
     } else if constexpr (M == 4) {
-      uint16_t a0, a1, a2, a3;
-      std::memcpy(&a0, A + 0 * lda + k, 2);
-      std::memcpy(&a1, A + 1 * lda + k, 2);
-      std::memcpy(&a2, A + 2 * lda + k, 2);
-      std::memcpy(&a3, A + 3 * lda + k, 2);
+      uint16_t a0 = *reinterpret_cast<const unaligned_u16*>(A + 0 * lda + k);
+      uint16_t a1 = *reinterpret_cast<const unaligned_u16*>(A + 1 * lda + k);
+      uint16_t a2 = *reinterpret_cast<const unaligned_u16*>(A + 2 * lda + k);
+      uint16_t a3 = *reinterpret_cast<const unaligned_u16*>(A + 3 * lda + k);
       va = (__vector unsigned int){static_cast<uint32_t>(a0),
                                    static_cast<uint32_t>(a1),
                                    static_cast<uint32_t>(a2),
@@ -449,7 +814,7 @@ class TileGemmPPC64 {
                                 const int32_t dynamic_k_size,
                                 const bool accum_c) {
     if constexpr (phase == AttentionGemmPhase::QK) {
-      gemm_macro_ppc64le_Mx8_Ku4<BLOCK_SIZE_ALIGNMENT, float, kv_cache_t>(
+      gemm_macro_ppc64le<BLOCK_SIZE_ALIGNMENT, float, kv_cache_t>(
           reinterpret_cast<const float*>(a_tile), b_tile, c_tile, m_size,
           k_size, lda, ldb, ldc, accum_c);
     } else {
@@ -463,11 +828,11 @@ class TileGemmPPC64 {
             return;
           }
         }
-        gemm_macro_ppc64le_Mx8_Ku4<HEAD_SIZE_ALIGNMENT, prob_t, kv_cache_t>(
+        gemm_macro_ppc64le<HEAD_SIZE_ALIGNMENT, prob_t, kv_cache_t>(
             reinterpret_cast<const prob_t*>(a_tile), b_tile, c_tile, m_size,
             dynamic_k_size, lda, ldb, ldc, accum_c);
       } else {
-        gemm_macro_ppc64le_Mx8_Ku4<HEAD_SIZE_ALIGNMENT, prob_t, kv_cache_t>(
+        gemm_macro_ppc64le<HEAD_SIZE_ALIGNMENT, prob_t, kv_cache_t>(
             reinterpret_cast<const prob_t*>(a_tile), b_tile, c_tile, m_size,
             dynamic_k_size, lda, ldb, ldc, accum_c);
       }
@@ -527,7 +892,6 @@ class AttentionImpl<ISA::VSX, scalar_t, head_dim> {
                                 const int64_t q_num_stride,
                                 const int64_t q_head_stride, float scale) {
     __vector float scale_vec = vec_splats(scale);
-    constexpr bool is_bf16 = std::is_same<scalar_t, c10::BFloat16>::value;
 
     for (int32_t i = 0; i < q_num; ++i) {
       for (int32_t h = 0; h < q_heads_per_kv; ++h) {
@@ -536,6 +900,21 @@ class AttentionImpl<ISA::VSX, scalar_t, head_dim> {
             q_buffer + i * q_heads_per_kv * head_dim + h * head_dim;
 
         int32_t d = 0;
+        for (; d <= head_dim - 16; d += 16) {
+          __vector float v0, v1, v2, v3;
+          load_row16_B_as_f32<scalar_t>(curr_src + d, v0, v1, v2, v3);
+
+          v0 = vec_mul(v0, scale_vec);
+          v1 = vec_mul(v1, scale_vec);
+          v2 = vec_mul(v2, scale_vec);
+          v3 = vec_mul(v3, scale_vec);
+
+          vec_xst(v0, 0, curr_dst + d + 0);
+          vec_xst(v1, 0, curr_dst + d + 4);
+          vec_xst(v2, 0, curr_dst + d + 8);
+          vec_xst(v3, 0, curr_dst + d + 12);
+        }
+
         for (; d <= head_dim - 8; d += 8) {
           __vector float v0, v1;
           load_row8_B_as_f32<scalar_t>(curr_src + d, v0, v1);
@@ -543,7 +922,7 @@ class AttentionImpl<ISA::VSX, scalar_t, head_dim> {
           v0 = vec_mul(v0, scale_vec);
           v1 = vec_mul(v1, scale_vec);
 
-          vec_xst(v0, 0, curr_dst + d);
+          vec_xst(v0, 0, curr_dst + d + 0);
           vec_xst(v1, 0, curr_dst + d + 4);
         }
 
