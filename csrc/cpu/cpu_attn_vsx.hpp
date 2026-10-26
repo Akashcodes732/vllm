@@ -57,6 +57,24 @@ FORCE_INLINE void load_row8_B_as_f32<c10::Half>(const c10::Half* p,
   b1 = fp32_vec.reg.val[1];
 }
 
+// Hoisted zeros overloads for load_row8_B_as_f32
+template <typename kv_cache_t>
+FORCE_INLINE void load_row8_B_as_f32(
+    const kv_cache_t* p, __vector float& b0, __vector float& b1,
+    [[maybe_unused]] const __vector unsigned short vzeros) {
+  load_row8_B_as_f32<kv_cache_t>(p, b0, b1);
+}
+
+template <>
+FORCE_INLINE void load_row8_B_as_f32<c10::BFloat16>(
+    const c10::BFloat16* p, __vector float& b0, __vector float& b1,
+    const __vector unsigned short vzeros) {
+  __vector unsigned short raw = vec_xl(
+      0, reinterpret_cast<unsigned short*>(const_cast<c10::BFloat16*>(p)));
+  b0 = (__vector float)vec_mergeh(vzeros, raw);
+  b1 = (__vector float)vec_mergel(vzeros, raw);
+}
+
 template <typename kv_cache_t>
 FORCE_INLINE void load_row16_B_as_f32(const kv_cache_t* p,
                                       __vector float& b0,
@@ -106,6 +124,30 @@ FORCE_INLINE void load_row16_B_as_f32<c10::Half>(const c10::Half* p,
   load_row8_B_as_f32<c10::Half>(p + 8, b2, b3);
 }
 
+// Hoisted zeros overloads for load_row16_B_as_f32
+template <typename kv_cache_t>
+FORCE_INLINE void load_row16_B_as_f32(
+    const kv_cache_t* p, __vector float& b0, __vector float& b1,
+    __vector float& b2, __vector float& b3,
+    [[maybe_unused]] const __vector unsigned short vzeros) {
+  load_row16_B_as_f32<kv_cache_t>(p, b0, b1, b2, b3);
+}
+
+template <>
+FORCE_INLINE void load_row16_B_as_f32<c10::BFloat16>(
+    const c10::BFloat16* p, __vector float& b0, __vector float& b1,
+    __vector float& b2, __vector float& b3,
+    const __vector unsigned short vzeros) {
+  const auto* u = reinterpret_cast<const unsigned short*>(p);
+  __vector unsigned short raw0 = vec_xl(0, const_cast<unsigned short*>(u + 0));
+  __vector unsigned short raw1 = vec_xl(0, const_cast<unsigned short*>(u + 8));
+
+  b0 = (__vector float)vec_mergeh(vzeros, raw0);
+  b1 = (__vector float)vec_mergel(vzeros, raw0);
+  b2 = (__vector float)vec_mergeh(vzeros, raw1);
+  b3 = (__vector float)vec_mergel(vzeros, raw1);
+}
+
 // Load 8 values of A (FP32)
 FORCE_INLINE void load_row8_A_f32(const float* p, __vector float& a0,
                                   __vector float& a1) {
@@ -119,12 +161,12 @@ FORCE_INLINE void load_row4_A_f32(const float* p, __vector float& a) {
 }
 
 // High-performance 16-column VSX microkernel with K unroll = 8
-template <int32_t M, typename kv_cache_t>
+template <int32_t M, typename kv_cache_t, bool ACCUMULATE = false>
 FORCE_INLINE void gemm_micro_ppc64le_Mx16_Ku8(
     const float* __restrict A,       // [M x K]
     const kv_cache_t* __restrict B,  // [K x 16]
     float* __restrict C,             // [M x 16]
-    int64_t lda, int64_t ldb, int64_t ldc, int32_t K, bool accumulate) {
+    int64_t lda, int64_t ldb, int64_t ldc, int32_t K) {
   static_assert(1 <= M && M <= 8, "M must be in [1,8]");
 
 #define ROWS_APPLY(OP) OP(0) OP(1) OP(2) OP(3) OP(4) OP(5) OP(6) OP(7)
@@ -141,22 +183,26 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx16_Ku8(
 #undef DECL_ACC
 
   // 3. Initialize Accumulators (Load C or Zero)
+  const __vector float vzero = vec_splats(0.0f);
 #define INIT_ACC(i)                                                    \
   IF_M(i) {                                                            \
-    if (accumulate) {                                                  \
+    if constexpr (ACCUMULATE) {                                        \
       acc##i##_0 = vec_xl(0, const_cast<float*>(C + (i) * ldc + 0));   \
       acc##i##_1 = vec_xl(0, const_cast<float*>(C + (i) * ldc + 4));   \
       acc##i##_2 = vec_xl(0, const_cast<float*>(C + (i) * ldc + 8));   \
       acc##i##_3 = vec_xl(0, const_cast<float*>(C + (i) * ldc + 12));  \
     } else {                                                           \
-      acc##i##_0 = vec_splats(0.0f);                                   \
-      acc##i##_1 = vec_splats(0.0f);                                   \
-      acc##i##_2 = vec_splats(0.0f);                                   \
-      acc##i##_3 = vec_splats(0.0f);                                   \
+      acc##i##_0 = vzero;                                              \
+      acc##i##_1 = vzero;                                              \
+      acc##i##_2 = vzero;                                              \
+      acc##i##_3 = vzero;                                              \
     }                                                                  \
   }
   ROWS_APPLY(INIT_ACC)
 #undef INIT_ACC
+
+  // Hoist loop-invariant zeros for BF16 unpack
+  const __vector unsigned short vzeros16 = vec_splat_u16(0);
 
   int32_t k = 0;
 
@@ -179,7 +225,7 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx16_Ku8(
     const kv_cache_t* b_k = B + (int64_t)k * ldb;
     {
       __vector float b0, b1, b2, b3;
-      load_row16_B_as_f32<kv_cache_t>(b_k, b0, b1, b2, b3);
+      load_row16_B_as_f32<kv_cache_t>(b_k, b0, b1, b2, b3, vzeros16);
 #define STEP0(i) FMAS_LANE(i, a##i##_03, 0)
       ROWS_APPLY(STEP0)
 #undef STEP0
@@ -187,7 +233,7 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx16_Ku8(
     b_k += ldb;
     {
       __vector float b0, b1, b2, b3;
-      load_row16_B_as_f32<kv_cache_t>(b_k, b0, b1, b2, b3);
+      load_row16_B_as_f32<kv_cache_t>(b_k, b0, b1, b2, b3, vzeros16);
 #define STEP1(i) FMAS_LANE(i, a##i##_03, 1)
       ROWS_APPLY(STEP1)
 #undef STEP1
@@ -195,7 +241,7 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx16_Ku8(
     b_k += ldb;
     {
       __vector float b0, b1, b2, b3;
-      load_row16_B_as_f32<kv_cache_t>(b_k, b0, b1, b2, b3);
+      load_row16_B_as_f32<kv_cache_t>(b_k, b0, b1, b2, b3, vzeros16);
 #define STEP2(i) FMAS_LANE(i, a##i##_03, 2)
       ROWS_APPLY(STEP2)
 #undef STEP2
@@ -203,7 +249,7 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx16_Ku8(
     b_k += ldb;
     {
       __vector float b0, b1, b2, b3;
-      load_row16_B_as_f32<kv_cache_t>(b_k, b0, b1, b2, b3);
+      load_row16_B_as_f32<kv_cache_t>(b_k, b0, b1, b2, b3, vzeros16);
 #define STEP3(i) FMAS_LANE(i, a##i##_03, 3)
       ROWS_APPLY(STEP3)
 #undef STEP3
@@ -211,7 +257,7 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx16_Ku8(
     b_k += ldb;
     {
       __vector float b0, b1, b2, b3;
-      load_row16_B_as_f32<kv_cache_t>(b_k, b0, b1, b2, b3);
+      load_row16_B_as_f32<kv_cache_t>(b_k, b0, b1, b2, b3, vzeros16);
 #define STEP4(i) FMAS_LANE(i, a##i##_47, 0)
       ROWS_APPLY(STEP4)
 #undef STEP4
@@ -219,7 +265,7 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx16_Ku8(
     b_k += ldb;
     {
       __vector float b0, b1, b2, b3;
-      load_row16_B_as_f32<kv_cache_t>(b_k, b0, b1, b2, b3);
+      load_row16_B_as_f32<kv_cache_t>(b_k, b0, b1, b2, b3, vzeros16);
 #define STEP5(i) FMAS_LANE(i, a##i##_47, 1)
       ROWS_APPLY(STEP5)
 #undef STEP5
@@ -227,7 +273,7 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx16_Ku8(
     b_k += ldb;
     {
       __vector float b0, b1, b2, b3;
-      load_row16_B_as_f32<kv_cache_t>(b_k, b0, b1, b2, b3);
+      load_row16_B_as_f32<kv_cache_t>(b_k, b0, b1, b2, b3, vzeros16);
 #define STEP6(i) FMAS_LANE(i, a##i##_47, 2)
       ROWS_APPLY(STEP6)
 #undef STEP6
@@ -235,7 +281,7 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx16_Ku8(
     b_k += ldb;
     {
       __vector float b0, b1, b2, b3;
-      load_row16_B_as_f32<kv_cache_t>(b_k, b0, b1, b2, b3);
+      load_row16_B_as_f32<kv_cache_t>(b_k, b0, b1, b2, b3, vzeros16);
 #define STEP7(i) FMAS_LANE(i, a##i##_47, 3)
       ROWS_APPLY(STEP7)
 #undef STEP7
@@ -262,7 +308,7 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx16_Ku8(
     const kv_cache_t* b_k = B + (int64_t)k * ldb;
     {
       __vector float b0, b1, b2, b3;
-      load_row16_B_as_f32<kv_cache_t>(b_k, b0, b1, b2, b3);
+      load_row16_B_as_f32<kv_cache_t>(b_k, b0, b1, b2, b3, vzeros16);
 #define STEP0(i) FMAS_LANE(i, a##i##_03, 0)
       ROWS_APPLY(STEP0)
 #undef STEP0
@@ -270,7 +316,7 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx16_Ku8(
     b_k += ldb;
     {
       __vector float b0, b1, b2, b3;
-      load_row16_B_as_f32<kv_cache_t>(b_k, b0, b1, b2, b3);
+      load_row16_B_as_f32<kv_cache_t>(b_k, b0, b1, b2, b3, vzeros16);
 #define STEP1(i) FMAS_LANE(i, a##i##_03, 1)
       ROWS_APPLY(STEP1)
 #undef STEP1
@@ -278,7 +324,7 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx16_Ku8(
     b_k += ldb;
     {
       __vector float b0, b1, b2, b3;
-      load_row16_B_as_f32<kv_cache_t>(b_k, b0, b1, b2, b3);
+      load_row16_B_as_f32<kv_cache_t>(b_k, b0, b1, b2, b3, vzeros16);
 #define STEP2(i) FMAS_LANE(i, a##i##_03, 2)
       ROWS_APPLY(STEP2)
 #undef STEP2
@@ -286,7 +332,7 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx16_Ku8(
     b_k += ldb;
     {
       __vector float b0, b1, b2, b3;
-      load_row16_B_as_f32<kv_cache_t>(b_k, b0, b1, b2, b3);
+      load_row16_B_as_f32<kv_cache_t>(b_k, b0, b1, b2, b3, vzeros16);
 #define STEP3(i) FMAS_LANE(i, a##i##_03, 3)
       ROWS_APPLY(STEP3)
 #undef STEP3
@@ -298,7 +344,7 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx16_Ku8(
   // Scalar tail for remaining 1..3 elements
   for (; k < K; ++k) {
     __vector float b0, b1, b2, b3;
-    load_row16_B_as_f32<kv_cache_t>(B + (int64_t)k * ldb, b0, b1, b2, b3);
+    load_row16_B_as_f32<kv_cache_t>(B + (int64_t)k * ldb, b0, b1, b2, b3, vzeros16);
 #define TAIL_ROW(i)                                                     \
   IF_M(i) {                                                             \
     __vector float ai = vec_splats(*(a##i + k));                        \
@@ -325,13 +371,25 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx16_Ku8(
 #undef IF_M
 }
 
-// 8-column VSX microkernel with K unroll = 8
 template <int32_t M, typename kv_cache_t>
+FORCE_INLINE void gemm_micro_ppc64le_Mx16_Ku8(
+    const float* __restrict A, const kv_cache_t* __restrict B,
+    float* __restrict C, int64_t lda, int64_t ldb, int64_t ldc, int32_t K,
+    bool accumulate) {
+  if (accumulate) {
+    gemm_micro_ppc64le_Mx16_Ku8<M, kv_cache_t, true>(A, B, C, lda, ldb, ldc, K);
+  } else {
+    gemm_micro_ppc64le_Mx16_Ku8<M, kv_cache_t, false>(A, B, C, lda, ldb, ldc, K);
+  }
+}
+
+// 8-column VSX microkernel with K unroll = 8
+template <int32_t M, typename kv_cache_t, bool ACCUMULATE = false>
 FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku8(
     const float* __restrict A,       // [M x K]
     const kv_cache_t* __restrict B,  // [K x 8]
     float* __restrict C,             // [M x 8]
-    int64_t lda, int64_t ldb, int64_t ldc, int32_t K, bool accumulate) {
+    int64_t lda, int64_t ldb, int64_t ldc, int32_t K) {
   static_assert(1 <= M && M <= 8, "M must be in [1,8]");
 
 #define ROWS_APPLY(OP) OP(0) OP(1) OP(2) OP(3) OP(4) OP(5) OP(6) OP(7)
@@ -348,18 +406,21 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku8(
 #undef DECL_ACC
 
   // 3. Initialize Accumulators (Load C or Zero)
+  const __vector float vzero = vec_splats(0.0f);
 #define INIT_ACC(i)                                                  \
   IF_M(i) {                                                          \
-    if (accumulate) {                                                \
+    if constexpr (ACCUMULATE) {                                      \
       acc##i##_0 = vec_xl(0, const_cast<float*>(C + (i) * ldc + 0)); \
       acc##i##_1 = vec_xl(0, const_cast<float*>(C + (i) * ldc + 4)); \
     } else {                                                         \
-      acc##i##_0 = vec_splats(0.0f);                                 \
-      acc##i##_1 = vec_splats(0.0f);                                 \
+      acc##i##_0 = vzero;                                            \
+      acc##i##_1 = vzero;                                            \
     }                                                                \
   }
   ROWS_APPLY(INIT_ACC)
 #undef INIT_ACC
+
+  const __vector unsigned short vzeros16 = vec_splat_u16(0);
 
   int32_t k = 0;
 
@@ -380,7 +441,7 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku8(
     const kv_cache_t* b_k = B + (int64_t)k * ldb;
     {
       __vector float b0, b1;
-      load_row8_B_as_f32<kv_cache_t>(b_k, b0, b1);
+      load_row8_B_as_f32<kv_cache_t>(b_k, b0, b1, vzeros16);
 #define STEP0(i) FMAS_LANE(i, a##i##_03, 0)
       ROWS_APPLY(STEP0)
 #undef STEP0
@@ -388,7 +449,7 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku8(
     b_k += ldb;
     {
       __vector float b0, b1;
-      load_row8_B_as_f32<kv_cache_t>(b_k, b0, b1);
+      load_row8_B_as_f32<kv_cache_t>(b_k, b0, b1, vzeros16);
 #define STEP1(i) FMAS_LANE(i, a##i##_03, 1)
       ROWS_APPLY(STEP1)
 #undef STEP1
@@ -396,7 +457,7 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku8(
     b_k += ldb;
     {
       __vector float b0, b1;
-      load_row8_B_as_f32<kv_cache_t>(b_k, b0, b1);
+      load_row8_B_as_f32<kv_cache_t>(b_k, b0, b1, vzeros16);
 #define STEP2(i) FMAS_LANE(i, a##i##_03, 2)
       ROWS_APPLY(STEP2)
 #undef STEP2
@@ -404,7 +465,7 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku8(
     b_k += ldb;
     {
       __vector float b0, b1;
-      load_row8_B_as_f32<kv_cache_t>(b_k, b0, b1);
+      load_row8_B_as_f32<kv_cache_t>(b_k, b0, b1, vzeros16);
 #define STEP3(i) FMAS_LANE(i, a##i##_03, 3)
       ROWS_APPLY(STEP3)
 #undef STEP3
@@ -412,15 +473,15 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku8(
     b_k += ldb;
     {
       __vector float b0, b1;
-      load_row8_B_as_f32<kv_cache_t>(b_k, b0, b1);
+      load_row8_B_as_f32<kv_cache_t>(b_k, b0, b1, vzeros16);
 #define STEP4(i) FMAS_LANE(i, a##i##_47, 0)
       ROWS_APPLY(STEP4)
 #undef STEP4
     }
     b_k += ldb;
     {
-      __vector float b0, b1;
-      load_row8_B_as_f32<kv_cache_t>(b_k, b0, b1);
+      __vector float b0, b1, b2, b3;
+      load_row8_B_as_f32<kv_cache_t>(b_k, b0, b1, vzeros16);
 #define STEP5(i) FMAS_LANE(i, a##i##_47, 1)
       ROWS_APPLY(STEP5)
 #undef STEP5
@@ -428,7 +489,7 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku8(
     b_k += ldb;
     {
       __vector float b0, b1;
-      load_row8_B_as_f32<kv_cache_t>(b_k, b0, b1);
+      load_row8_B_as_f32<kv_cache_t>(b_k, b0, b1, vzeros16);
 #define STEP6(i) FMAS_LANE(i, a##i##_47, 2)
       ROWS_APPLY(STEP6)
 #undef STEP6
@@ -436,7 +497,7 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku8(
     b_k += ldb;
     {
       __vector float b0, b1;
-      load_row8_B_as_f32<kv_cache_t>(b_k, b0, b1);
+      load_row8_B_as_f32<kv_cache_t>(b_k, b0, b1, vzeros16);
 #define STEP7(i) FMAS_LANE(i, a##i##_47, 3)
       ROWS_APPLY(STEP7)
 #undef STEP7
@@ -460,7 +521,7 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku8(
     const kv_cache_t* b_k = B + (int64_t)k * ldb;
     {
       __vector float b0, b1;
-      load_row8_B_as_f32<kv_cache_t>(b_k, b0, b1);
+      load_row8_B_as_f32<kv_cache_t>(b_k, b0, b1, vzeros16);
 #define STEP0(i) FMAS_LANE(i, a##i##_03, 0)
       ROWS_APPLY(STEP0)
 #undef STEP0
@@ -468,7 +529,7 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku8(
     b_k += ldb;
     {
       __vector float b0, b1;
-      load_row8_B_as_f32<kv_cache_t>(b_k, b0, b1);
+      load_row8_B_as_f32<kv_cache_t>(b_k, b0, b1, vzeros16);
 #define STEP1(i) FMAS_LANE(i, a##i##_03, 1)
       ROWS_APPLY(STEP1)
 #undef STEP1
@@ -476,7 +537,7 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku8(
     b_k += ldb;
     {
       __vector float b0, b1;
-      load_row8_B_as_f32<kv_cache_t>(b_k, b0, b1);
+      load_row8_B_as_f32<kv_cache_t>(b_k, b0, b1, vzeros16);
 #define STEP2(i) FMAS_LANE(i, a##i##_03, 2)
       ROWS_APPLY(STEP2)
 #undef STEP2
@@ -484,7 +545,7 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku8(
     b_k += ldb;
     {
       __vector float b0, b1;
-      load_row8_B_as_f32<kv_cache_t>(b_k, b0, b1);
+      load_row8_B_as_f32<kv_cache_t>(b_k, b0, b1, vzeros16);
 #define STEP3(i) FMAS_LANE(i, a##i##_03, 3)
       ROWS_APPLY(STEP3)
 #undef STEP3
@@ -495,7 +556,7 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku8(
 
   for (; k < K; ++k) {
     __vector float b0, b1;
-    load_row8_B_as_f32<kv_cache_t>(B + (int64_t)k * ldb, b0, b1);
+    load_row8_B_as_f32<kv_cache_t>(B + (int64_t)k * ldb, b0, b1, vzeros16);
 #define TAIL_ROW(i)                                                     \
   IF_M(i) {                                                             \
     __vector float ai = vec_splats(*(a##i + k));                        \
@@ -518,6 +579,18 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku8(
 #undef IF_M
 }
 
+template <int32_t M, typename kv_cache_t>
+FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku8(
+    const float* __restrict A, const kv_cache_t* __restrict B,
+    float* __restrict C, int64_t lda, int64_t ldb, int64_t ldc, int32_t K,
+    bool accumulate) {
+  if (accumulate) {
+    gemm_micro_ppc64le_Mx8_Ku8<M, kv_cache_t, true>(A, B, C, lda, ldb, ldc, K);
+  } else {
+    gemm_micro_ppc64le_Mx8_Ku8<M, kv_cache_t, false>(A, B, C, lda, ldb, ldc, K);
+  }
+}
+
 // Backward compatibility wrapper
 template <int32_t M, typename kv_cache_t>
 FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku4(
@@ -529,13 +602,12 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku4(
 }
 
 // Macro GEMM using 16-column tiles with 8-column remainder
-template <int32_t N, typename kv_cache_t>
-FORCE_INLINE void gemm_macro_ppc64le(const float* __restrict A,
-                                     const kv_cache_t* __restrict B,
-                                     float* __restrict C, int32_t M,
-                                     int32_t K, int64_t lda,
-                                     int64_t ldb, int64_t ldc,
-                                     bool accumulate) {
+template <int32_t N, typename kv_cache_t, bool ACCUMULATE>
+FORCE_INLINE void gemm_macro_ppc64le_impl(const float* __restrict A,
+                                          const kv_cache_t* __restrict B,
+                                          float* __restrict C, int32_t M,
+                                          int32_t K, int64_t lda,
+                                          int64_t ldb, int64_t ldc) {
   static_assert(N % 8 == 0, "N must be a multiple of 8");
   for (int32_t m = 0; m < M;) {
     int32_t mb = (M - m >= 8) ? 8 : (M - m >= 6) ? 6 : (M - m >= 4) ? 4 : (M - m >= 2) ? 2 : 1;
@@ -548,24 +620,19 @@ FORCE_INLINE void gemm_macro_ppc64le(const float* __restrict A,
       float* Cn = Cb + n;
       switch (mb) {
         case 8:
-          gemm_micro_ppc64le_Mx16_Ku8<8, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
-                                                           K, accumulate);
+          gemm_micro_ppc64le_Mx16_Ku8<8, kv_cache_t, ACCUMULATE>(Ab, Bn, Cn, lda, ldb, ldc, K);
           break;
         case 6:
-          gemm_micro_ppc64le_Mx16_Ku8<6, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
-                                                           K, accumulate);
+          gemm_micro_ppc64le_Mx16_Ku8<6, kv_cache_t, ACCUMULATE>(Ab, Bn, Cn, lda, ldb, ldc, K);
           break;
         case 4:
-          gemm_micro_ppc64le_Mx16_Ku8<4, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
-                                                           K, accumulate);
+          gemm_micro_ppc64le_Mx16_Ku8<4, kv_cache_t, ACCUMULATE>(Ab, Bn, Cn, lda, ldb, ldc, K);
           break;
         case 2:
-          gemm_micro_ppc64le_Mx16_Ku8<2, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
-                                                           K, accumulate);
+          gemm_micro_ppc64le_Mx16_Ku8<2, kv_cache_t, ACCUMULATE>(Ab, Bn, Cn, lda, ldb, ldc, K);
           break;
         default:
-          gemm_micro_ppc64le_Mx16_Ku8<1, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
-                                                           K, accumulate);
+          gemm_micro_ppc64le_Mx16_Ku8<1, kv_cache_t, ACCUMULATE>(Ab, Bn, Cn, lda, ldb, ldc, K);
           break;
       }
     }
@@ -575,28 +642,37 @@ FORCE_INLINE void gemm_macro_ppc64le(const float* __restrict A,
       float* Cn = Cb + n;
       switch (mb) {
         case 8:
-          gemm_micro_ppc64le_Mx8_Ku8<8, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
-                                                          K, accumulate);
+          gemm_micro_ppc64le_Mx8_Ku8<8, kv_cache_t, ACCUMULATE>(Ab, Bn, Cn, lda, ldb, ldc, K);
           break;
         case 6:
-          gemm_micro_ppc64le_Mx8_Ku8<6, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
-                                                          K, accumulate);
+          gemm_micro_ppc64le_Mx8_Ku8<6, kv_cache_t, ACCUMULATE>(Ab, Bn, Cn, lda, ldb, ldc, K);
           break;
         case 4:
-          gemm_micro_ppc64le_Mx8_Ku8<4, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
-                                                          K, accumulate);
+          gemm_micro_ppc64le_Mx8_Ku8<4, kv_cache_t, ACCUMULATE>(Ab, Bn, Cn, lda, ldb, ldc, K);
           break;
         case 2:
-          gemm_micro_ppc64le_Mx8_Ku8<2, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
-                                                          K, accumulate);
+          gemm_micro_ppc64le_Mx8_Ku8<2, kv_cache_t, ACCUMULATE>(Ab, Bn, Cn, lda, ldb, ldc, K);
           break;
         default:
-          gemm_micro_ppc64le_Mx8_Ku8<1, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
-                                                          K, accumulate);
+          gemm_micro_ppc64le_Mx8_Ku8<1, kv_cache_t, ACCUMULATE>(Ab, Bn, Cn, lda, ldb, ldc, K);
           break;
       }
     }
     m += mb;
+  }
+}
+
+template <int32_t N, typename kv_cache_t>
+FORCE_INLINE void gemm_macro_ppc64le(const float* __restrict A,
+                                     const kv_cache_t* __restrict B,
+                                     float* __restrict C, int32_t M,
+                                     int32_t K, int64_t lda,
+                                     int64_t ldb, int64_t ldc,
+                                     bool accumulate) {
+  if (accumulate) {
+    gemm_macro_ppc64le_impl<N, kv_cache_t, true>(A, B, C, M, K, lda, ldb, ldc);
+  } else {
+    gemm_macro_ppc64le_impl<N, kv_cache_t, false>(A, B, C, M, K, lda, ldb, ldc);
   }
 }
 

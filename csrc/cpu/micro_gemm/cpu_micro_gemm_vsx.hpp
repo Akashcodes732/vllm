@@ -82,16 +82,13 @@ class TileGemmVSX {
       }
 
       for (int i = 0; i < M; i++) {
-        uint32_t a_val;
-        std::memcpy(&a_val, &a_ptr[i * lda + k_idx], 4);
-        uint32_t a0_u = (a_val & 0xFFFF) << 16;
-        uint32_t a1_u = a_val & 0xFFFF0000;
-        float a0_f, a1_f;
-        std::memcpy(&a0_f, &a0_u, 4);
-        std::memcpy(&a1_f, &a1_u, 4);
-
-        __vector float vA0 = vec_splats(a0_f);
-        __vector float vA1 = vec_splats(a1_f);
+        typedef uint32_t __attribute__((__may_alias__)) aliased_u32;
+        const aliased_u32 a_val =
+            *reinterpret_cast<const aliased_u32*>(&a_ptr[i * lda + k_idx]);
+        const __vector unsigned int vA_bits = {
+            (a_val & 0xFFFF) << 16, a_val & 0xFFFF0000, 0, 0};
+        const __vector float vA0 = (__vector float)vec_splat(vA_bits, 0);
+        const __vector float vA1 = (__vector float)vec_splat(vA_bits, 1);
 
 #pragma GCC unroll 4
         for (int j = 0; j < 4; j++) {
@@ -296,71 +293,22 @@ class TileGemmVSX {
 
     // Remainder loop processing 2 columns at a time
     for (; k_idx < k; k_idx += 2) {
+      typedef uint32_t __attribute__((__may_alias__)) aliased_u32;
+      auto load_val = [&](int r) -> uint32_t {
+        if (r < M) {
+          return *reinterpret_cast<const aliased_u32*>(&a_ptr[r * lda + k_idx]);
+        }
+        return 0;
+      };
+
       __vector unsigned int vA_uint[tiles_m];
-      if constexpr (M == 1) {
-        uint32_t val0;
-        std::memcpy(&val0, &a_ptr[0 * lda + k_idx], 4);
-        vA_uint[0] = (__vector unsigned int){val0, 0, 0, 0};
-      } else if constexpr (M == 2) {
-        uint32_t val0, val1;
-        std::memcpy(&val0, &a_ptr[0 * lda + k_idx], 4);
-        std::memcpy(&val1, &a_ptr[1 * lda + k_idx], 4);
-        vA_uint[0] = (__vector unsigned int){val0, val1, 0, 0};
-      } else if constexpr (M == 3) {
-        uint32_t val0, val1, val2;
-        std::memcpy(&val0, &a_ptr[0 * lda + k_idx], 4);
-        std::memcpy(&val1, &a_ptr[1 * lda + k_idx], 4);
-        std::memcpy(&val2, &a_ptr[2 * lda + k_idx], 4);
-        vA_uint[0] = (__vector unsigned int){val0, val1, val2, 0};
-      } else if constexpr (M == 4) {
-        uint32_t val0, val1, val2, val3;
-        std::memcpy(&val0, &a_ptr[0 * lda + k_idx], 4);
-        std::memcpy(&val1, &a_ptr[1 * lda + k_idx], 4);
-        std::memcpy(&val2, &a_ptr[2 * lda + k_idx], 4);
-        std::memcpy(&val3, &a_ptr[3 * lda + k_idx], 4);
-        vA_uint[0] = (__vector unsigned int){val0, val1, val2, val3};
-      } else if constexpr (M == 5) {
-        uint32_t val0, val1, val2, val3, val4;
-        std::memcpy(&val0, &a_ptr[0 * lda + k_idx], 4);
-        std::memcpy(&val1, &a_ptr[1 * lda + k_idx], 4);
-        std::memcpy(&val2, &a_ptr[2 * lda + k_idx], 4);
-        std::memcpy(&val3, &a_ptr[3 * lda + k_idx], 4);
-        vA_uint[0] = (__vector unsigned int){val0, val1, val2, val3};
-        std::memcpy(&val4, &a_ptr[4 * lda + k_idx], 4);
-        vA_uint[1] = (__vector unsigned int){val4, 0, 0, 0};
-      } else if constexpr (M == 6) {
-        uint32_t val0, val1, val2, val3, val4, val5;
-        std::memcpy(&val0, &a_ptr[0 * lda + k_idx], 4);
-        std::memcpy(&val1, &a_ptr[1 * lda + k_idx], 4);
-        std::memcpy(&val2, &a_ptr[2 * lda + k_idx], 4);
-        std::memcpy(&val3, &a_ptr[3 * lda + k_idx], 4);
-        vA_uint[0] = (__vector unsigned int){val0, val1, val2, val3};
-        std::memcpy(&val4, &a_ptr[4 * lda + k_idx], 4);
-        std::memcpy(&val5, &a_ptr[5 * lda + k_idx], 4);
-        vA_uint[1] = (__vector unsigned int){val4, val5, 0, 0};
-      } else if constexpr (M == 7) {
-        uint32_t val0, val1, val2, val3, val4, val5, val6;
-        std::memcpy(&val0, &a_ptr[0 * lda + k_idx], 4);
-        std::memcpy(&val1, &a_ptr[1 * lda + k_idx], 4);
-        std::memcpy(&val2, &a_ptr[2 * lda + k_idx], 4);
-        std::memcpy(&val3, &a_ptr[3 * lda + k_idx], 4);
-        vA_uint[0] = (__vector unsigned int){val0, val1, val2, val3};
-        std::memcpy(&val4, &a_ptr[4 * lda + k_idx], 4);
-        std::memcpy(&val5, &a_ptr[5 * lda + k_idx], 4);
-        std::memcpy(&val6, &a_ptr[6 * lda + k_idx], 4);
-        vA_uint[1] = (__vector unsigned int){val4, val5, val6, 0};
-      } else if constexpr (M == 8) {
-        uint32_t val0, val1, val2, val3, val4, val5, val6, val7;
-        std::memcpy(&val0, &a_ptr[0 * lda + k_idx], 4);
-        std::memcpy(&val1, &a_ptr[1 * lda + k_idx], 4);
-        std::memcpy(&val2, &a_ptr[2 * lda + k_idx], 4);
-        std::memcpy(&val3, &a_ptr[3 * lda + k_idx], 4);
-        vA_uint[0] = (__vector unsigned int){val0, val1, val2, val3};
-        std::memcpy(&val4, &a_ptr[4 * lda + k_idx], 4);
-        std::memcpy(&val5, &a_ptr[5 * lda + k_idx], 4);
-        std::memcpy(&val6, &a_ptr[6 * lda + k_idx], 4);
-        std::memcpy(&val7, &a_ptr[7 * lda + k_idx], 4);
-        vA_uint[1] = (__vector unsigned int){val4, val5, val6, val7};
+      if constexpr (tiles_m >= 1) {
+        vA_uint[0] = (__vector unsigned int){load_val(0), load_val(1),
+                                             load_val(2), load_val(3)};
+      }
+      if constexpr (tiles_m >= 2) {
+        vA_uint[1] = (__vector unsigned int){load_val(4), load_val(5),
+                                             load_val(6), load_val(7)};
       }
 
       // Load packed B
