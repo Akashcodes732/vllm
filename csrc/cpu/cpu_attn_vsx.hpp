@@ -636,7 +636,7 @@ class TileGemmPPC64 {
 
 }  // namespace
 
-template <typename scalar_t, int64_t head_dim, typename kv_cache_scalar_t = scalar_t>
+template <typename scalar_t, int64_t head_dim, typename kv_cache_scalar_t>
 class AttentionImpl<ISA::VSX, scalar_t, head_dim, kv_cache_scalar_t> {
  public:
   using query_t = scalar_t;
