@@ -61,9 +61,36 @@ FORCE_INLINE void load_row8_B_as_f32<c10::Half>(const c10::Half* p,
   b1 = fp32_vec.reg.val[1];
 }
 
-template <int32_t M, typename kv_cache_t>
+template <typename a_t>
+FORCE_INLINE void load_row4_A_as_f32(const a_t* p, __vector float& a);
+
+template <>
+FORCE_INLINE void load_row4_A_as_f32<float>(const float* p, __vector float& a) {
+  a = vec_xl(0, const_cast<float*>(p));
+}
+
+template <>
+FORCE_INLINE void load_row4_A_as_f32<c10::BFloat16>(const c10::BFloat16* p,
+                                                    __vector float& a) {
+  typedef uint64_t __attribute__((__may_alias__)) aliased_u64;
+  const uint64_t raw64 = *reinterpret_cast<const aliased_u64*>(p);
+  const __vector unsigned long long v64 = {raw64, 0};
+  const __vector unsigned short raw = (__vector unsigned short)v64;
+  const __vector unsigned short zeros = vec_splat_u16(0);
+  a = (__vector float)vec_mergeh(zeros, raw);
+}
+
+template <>
+FORCE_INLINE void load_row4_A_as_f32<c10::Half>(const c10::Half* p,
+                                                __vector float& a) {
+  a = (__vector float){
+      static_cast<float>(p[0]), static_cast<float>(p[1]),
+      static_cast<float>(p[2]), static_cast<float>(p[3])};
+}
+
+template <int32_t M, typename a_t, typename kv_cache_t>
 FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku4(
-    const float* __restrict A,       // [M x K]
+    const a_t* __restrict A,         // [M x K]
     const kv_cache_t* __restrict B,  // [K x 8]
     float* __restrict C,             // [M x 8]
     int64_t lda, int64_t ldb, int64_t ldc, int32_t K, bool accumulate) {
@@ -73,7 +100,7 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku4(
 #define IF_M(i) if constexpr (M > (i))
 
   // 1. Define A pointers
-#define DECL_A(i) const float* a##i = A + (i) * lda;
+#define DECL_A(i) const a_t* a##i = A + (i) * lda;
   ROWS_APPLY(DECL_A)
 #undef DECL_A
 
@@ -102,7 +129,7 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku4(
     // Load 4 values of A for each Row M: A[k...k+3]
 #define LOAD_A4(i)        \
   __vector float a##i##v; \
-  IF_M(i) a##i##v = vec_xl(0, const_cast<float*>(a##i + k));
+  IF_M(i) load_row4_A_as_f32<a_t>(a##i + k, a##i##v);
     ROWS_APPLY(LOAD_A4)
 #undef LOAD_A4
 
@@ -150,11 +177,11 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku4(
   for (; k < K; ++k) {
     __vector float b0, b1;
     load_row8_B_as_f32<kv_cache_t>(B + (int64_t)k * ldb, b0, b1);
-#define TAIL_ROW(i)                              \
-  IF_M(i) {                                      \
-    __vector float ai = vec_splats(*(a##i + k)); \
-    acc##i##_0 = vec_madd(b0, ai, acc##i##_0);   \
-    acc##i##_1 = vec_madd(b1, ai, acc##i##_1);   \
+#define TAIL_ROW(i)                                                     \
+  IF_M(i) {                                                             \
+    __vector float ai = vec_splats(static_cast<float>(*(a##i + k)));   \
+    acc##i##_0 = vec_madd(b0, ai, acc##i##_0);                          \
+    acc##i##_1 = vec_madd(b1, ai, acc##i##_1);                          \
   }
     ROWS_APPLY(TAIL_ROW)
 #undef TAIL_ROW
@@ -172,8 +199,8 @@ FORCE_INLINE void gemm_micro_ppc64le_Mx8_Ku4(
 #undef IF_M
 }
 
-template <int32_t N, typename kv_cache_t>
-FORCE_INLINE void gemm_macro_ppc64le_Mx8_Ku4(const float* __restrict A,
+template <int32_t N, typename a_t, typename kv_cache_t>
+FORCE_INLINE void gemm_macro_ppc64le_Mx8_Ku4(const a_t* __restrict A,
                                              const kv_cache_t* __restrict B,
                                              float* __restrict C, int32_t M,
                                              int32_t K, int64_t lda,
@@ -182,7 +209,7 @@ FORCE_INLINE void gemm_macro_ppc64le_Mx8_Ku4(const float* __restrict A,
   static_assert(N % 8 == 0, "N must be a multiple of 8");
   for (int32_t m = 0; m < M;) {
     int32_t mb = (M - m >= 8) ? 8 : (M - m >= 4) ? 4 : (M - m >= 2) ? 2 : 1;
-    const float* Ab = A + m * lda;
+    const a_t* Ab = A + m * lda;
     float* Cb = C + m * ldc;
 
     for (int32_t n = 0; n < N; n += 8) {
@@ -190,20 +217,20 @@ FORCE_INLINE void gemm_macro_ppc64le_Mx8_Ku4(const float* __restrict A,
       float* Cn = Cb + n;
       switch (mb) {
         case 8:
-          gemm_micro_ppc64le_Mx8_Ku4<8, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
-                                                    K, accumulate);
+          gemm_micro_ppc64le_Mx8_Ku4<8, a_t, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
+                                                         K, accumulate);
           break;
         case 4:
-          gemm_micro_ppc64le_Mx8_Ku4<4, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
-                                                    K, accumulate);
+          gemm_micro_ppc64le_Mx8_Ku4<4, a_t, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
+                                                         K, accumulate);
           break;
         case 2:
-          gemm_micro_ppc64le_Mx8_Ku4<2, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
-                                                    K, accumulate);
+          gemm_micro_ppc64le_Mx8_Ku4<2, a_t, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
+                                                         K, accumulate);
           break;
         default:
-          gemm_micro_ppc64le_Mx8_Ku4<1, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
-                                                    K, accumulate);
+          gemm_micro_ppc64le_Mx8_Ku4<1, a_t, kv_cache_t>(Ab, Bn, Cn, lda, ldb, ldc,
+                                                         K, accumulate);
           break;
       }
     }
@@ -214,9 +241,12 @@ FORCE_INLINE void gemm_macro_ppc64le_Mx8_Ku4(const float* __restrict A,
 template <typename kv_cache_t>
 class TileGemmPPC64 {
  public:
+  using prob_t = std::conditional_t<std::is_same_v<kv_cache_t, float>, float,
+                                    c10::BFloat16>;
+
   template <AttentionGemmPhase phase, int32_t k_size>
   FORCE_INLINE static void gemm(const int32_t m_size,
-                                float* __restrict__ a_tile,
+                                const void* __restrict__ a_tile,
                                 kv_cache_t* __restrict__ b_tile,
                                 float* __restrict__ c_tile, const int64_t lda,
                                 const int64_t ldb, const int64_t ldc,
@@ -224,27 +254,29 @@ class TileGemmPPC64 {
                                 const int32_t dynamic_k_size,
                                 const bool accum_c) {
     if constexpr (phase == AttentionGemmPhase::QK) {
-      gemm_macro_ppc64le_Mx8_Ku4<BLOCK_SIZE_ALIGNMENT, kv_cache_t>(
-          a_tile, b_tile, c_tile, m_size, k_size, lda, ldb, ldc, accum_c);
+      gemm_macro_ppc64le_Mx8_Ku4<BLOCK_SIZE_ALIGNMENT, float, kv_cache_t>(
+          reinterpret_cast<const float*>(a_tile), b_tile, c_tile, m_size,
+          k_size, lda, ldb, ldc, accum_c);
     } else {
-      gemm_macro_ppc64le_Mx8_Ku4<HEAD_SIZE_ALIGNMENT, kv_cache_t>(
-          a_tile, b_tile, c_tile, m_size, dynamic_k_size, lda, ldb, ldc,
-          accum_c);
+      gemm_macro_ppc64le_Mx8_Ku4<HEAD_SIZE_ALIGNMENT, prob_t, kv_cache_t>(
+          reinterpret_cast<const prob_t*>(a_tile), b_tile, c_tile, m_size,
+          dynamic_k_size, lda, ldb, ldc, accum_c);
     }
   }
 };
 
 }  // namespace
 
-template <typename scalar_t, int64_t head_dim>
-class AttentionImpl<ISA::VSX, scalar_t, head_dim> {
+template <typename scalar_t, int64_t head_dim, typename kv_cache_scalar_t>
+class AttentionImpl<ISA::VSX, scalar_t, head_dim, kv_cache_scalar_t> {
  public:
   using query_t = scalar_t;
   using q_buffer_t = float;
   using kv_cache_t = scalar_t;
   using logits_buffer_t = float;
   using partial_output_buffer_t = float;
-  using prob_buffer_t = float;
+  using prob_buffer_t = std::conditional_t<std::is_same_v<scalar_t, float>,
+                                           float, c10::BFloat16>;
 
   constexpr static int64_t BlockSizeAlignment = BLOCK_SIZE_ALIGNMENT;
   constexpr static int64_t HeadDimAlignment = HEAD_SIZE_ALIGNMENT;
